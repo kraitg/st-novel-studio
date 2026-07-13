@@ -1,6 +1,7 @@
 # Novel Studio 小说工坊 (v1.9)
 
-一个 **SillyTavern / TauriTavern 第三方扩展** 的调试骨架。依赖node.js当前版本只做一件事：
+一个 **SillyTavern / TauriTavern 第三方扩展** 的调试骨架。依赖node.js,是用前请先安装依赖,
+当前版本只做一件事：
 
 - 在**扩展栏（魔杖菜单 `#extensionsMenu`）**注入一个「**开始创意**」入口
 - 点击后打开一个**全屏面板 GUI**
