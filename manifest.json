@@ -1,0 +1,13 @@
+{
+  "display_name": "Novel Studio 小说工坊",
+  "loading_order": 100,
+  "requires": [],
+  "optional": ["third-party/JS-Slash-Runner"],
+  "dependencies": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "you",
+  "version": "1.9.0",
+  "homePage": "https://github.com/",
+  "auto_update": false
+}
