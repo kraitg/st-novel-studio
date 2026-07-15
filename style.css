@@ -463,7 +463,7 @@
 }
 .ns-outline-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
 }
 .ns-outline-no {
@@ -498,7 +498,7 @@
 }
 .ns-entity-input {
   flex: 1;
-  padding: 6px 10px;
+  padding: 5px 10px;
   border-radius: 6px;
   color: var(--SmartThemeBodyColor, #e6e6e6);
   background: var(--black30a, rgba(0, 0, 0, 0.25));
@@ -506,10 +506,15 @@
   font-family: inherit;
   font-size: 0.9rem;
   box-sizing: border-box;
+  resize: vertical;
+  min-height: 2em;
+  line-height: 1.4;
+  overflow: hidden; /* 初始不显示滚动条，拉伸后内容自然展开 */
 }
 .ns-entity-input:focus {
   outline: none;
   border-color: var(--SmartThemeQuoteColor, #6a8dff);
+  overflow: auto;
 }
 
 .ns-chapters {
@@ -525,7 +530,7 @@
 }
 .ns-chapter__head {
   display: flex;
-  align-items: center;
+  align-items: flex-start; /* 垂直拉伸 textarea 时图标固定在顶部 */
   gap: 8px;
   flex-wrap: wrap;
 }
@@ -625,6 +630,51 @@
   border-radius: 6px;
   background: var(--black30a, rgba(0, 0, 0, 0.18));
   border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.08));
+  transition: border-color 0.12s ease, opacity 0.12s ease;
+}
+/* 节内 input/textarea 不受 user-select 影响 */
+.ns-section input, .ns-section textarea {
+  user-select: text;
+}
+/* 拖拽进行中禁止文字选中(全局) */
+body.ns-dragging-active {
+  user-select: none !important;
+  cursor: grabbing !important;
+}
+body.ns-dragging-active * {
+  cursor: grabbing !important;
+}
+/* 拖拽手柄 */
+.ns-drag-handle {
+  cursor: grab;
+  opacity: 0.45;
+  padding: 0 4px 0 0;
+  flex: none;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+.ns-drag-handle:active {
+  cursor: grabbing;
+}
+/* 拖拽中的节（半透明）*/
+.ns-section.ns-sec-dragging {
+  opacity: 0.4;
+}
+/* 悬停放置目标高亮 */
+.ns-section.ns-sec-dragover {
+  border-color: var(--SmartThemeQuoteColor, #6a8dff);
+  box-shadow: 0 0 0 1px var(--SmartThemeQuoteColor, #6a8dff);
+}
+/* 锁定节 */
+.ns-section.ns-sec-locked {
+  border-color: rgba(255, 200, 80, 0.35);
+  background: rgba(255, 200, 80, 0.04);
+}
+.ns-lock-icon {
+  flex: none;
+  font-size: 0.8rem;
+  color: rgba(255, 200, 80, 0.8);
+  padding-right: 4px;
 }
 .ns-sec-outline,
 .ns-ct-sec-outline {
@@ -636,6 +686,18 @@
   background: var(--black30a, rgba(0, 0, 0, 0.25));
   border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
   font-size: 0.85rem;
+  font-family: inherit;
+  resize: vertical;
+  min-height: 1.8em;
+  line-height: 1.4;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.ns-sec-outline:focus,
+.ns-ct-sec-outline:focus {
+  outline: none;
+  border-color: var(--SmartThemeQuoteColor, #6a8dff);
+  overflow: auto;
 }
 
 /* 正在生成的章节 */

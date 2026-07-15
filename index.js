@@ -39,6 +39,10 @@ const DEFAULT_SETTINGS = Object.freeze({
   contextTailChars: 2500,
   continuations: [],      // 续写会话列表(替代旧的单项 continuation)
   activeContinuationId: '',
+  // 请求可靠性
+  genMaxRetries: 3,       // 生成失败(504/空回复/超时)最大重试次数
+  genRetryBaseMs: 1500,   // 重试基础延迟(指数退避)
+  genTimeoutMs: 180000,   // 单次生成超时(毫秒)
 });
 
 /** 生成短 id。 */
@@ -316,6 +320,7 @@ function safeFileName(name) {
 /* ================================================================== */
 
 const novelState = { generating: false, cancelRequested: false, currentGenId: '', activeFlatIdx: -1, activeActIdx: -1 };
+let _novelDragAttach = null; // 写小说节拖拽重绑函数
 
 /* ---------------------------- 项目 CRUD ---------------------------- */
 
@@ -418,6 +423,40 @@ function isActComplete(act) {
   return secs.length > 0 && secs.every((s) => s.done);
 }
 
+/* ------------------------------------------------------------------ */
+/* 章节锁定                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 锁定某节及其之前所有节（展平顺序）的正文。
+ * 传入 obj(proj/cont)、目标 actIdx、secIdx。
+ */
+function lockUpToSection(obj, targetActIdx, targetSecIdx) {
+  const flat = flatSections(obj);
+  const targetFlat = flat.find((f) => f.actIdx === targetActIdx && f.secIdx === targetSecIdx);
+  if (!targetFlat) return;
+  for (const f of flat) {
+    if (f.flatIdx <= targetFlat.flatIdx) f.sec.locked = true;
+  }
+}
+
+/**
+ * 解锁某节及其之后所有节。
+ */
+function unlockFromSection(obj, targetActIdx, targetSecIdx) {
+  const flat = flatSections(obj);
+  const targetFlat = flat.find((f) => f.actIdx === targetActIdx && f.secIdx === targetSecIdx);
+  if (!targetFlat) return;
+  for (const f of flat) {
+    if (f.flatIdx >= targetFlat.flatIdx) f.sec.locked = false;
+  }
+}
+
+/** 检查节是否被锁定。 */
+function isSectionLocked(sec) {
+  return !!sec.locked;
+}
+
 function createProject(title) {
   const s = getSettings();
   const proj = makeProject(title, 'manual');
@@ -448,32 +487,248 @@ function touchProject(proj) {
 /* ---------------------------- 生成封装 ---------------------------- */
 
 /** 后台生成(优先 TavernHelper.generateRaw, 降级原生), 不带角色卡/世界书/历史。 */
-async function novelGenerateWithId({ system, user }, gid) {
-  const th = getTavernHelper();
-  if (th && typeof th.generateRaw === 'function') {
-    const result = await th.generateRaw({
-      ordered_prompts: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-      should_stream: false,
-      should_silence: true,
-      generation_id: gid,
+/** sleep 工具。 */
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * 给 containerSel 内的节绑定拖拽排序。
+ * 用 pointer 事件(非 HTML5 drag)实现，绕过 Tauri 对 dragover/drop 的劫持。
+ * 策略: 手柄 pointerdown 开始追踪 → pointermove 高亮目标 → pointerup 完成排序。
+ */
+function bindSectionDrag(containerSel, getSec, save, rerender) {
+  const $ = globalThis.jQuery;
+  if (!$) return null;
+  const $root = $(containerSel);
+  if (!$root.length) return null;
+  const root = $root[0];
+
+  // 卸载旧绑定
+  const oldCleanup = $root.data('drag-cleanup');
+  if (typeof oldCleanup === 'function') oldCleanup();
+
+  let isDragging = false;
+  let dragSrcAi = -1, dragSrcSi = -1;
+  let pointerId = null;
+
+  // 全局 pointermove / pointerup（绑在 document 上，持续追踪）
+  function onDocPointerMove(e) {
+    if (!isDragging) return;
+    // 找鼠标下方的节
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (!el) return;
+    const sec = el.closest?.('.ns-section');
+    if (!sec) return;
+    const tAi = Number(sec.dataset.a);
+    const tSi = Number(sec.dataset.s);
+    if (isNaN(tAi) || isNaN(tSi)) return;
+    // 高亮目标(同章内才高亮)
+    if (tAi === dragSrcAi && tSi !== dragSrcSi) {
+      root.querySelectorAll('.ns-section').forEach((s) => s.classList.remove('ns-sec-dragover'));
+      sec.classList.add('ns-sec-dragover');
+    } else {
+      sec.classList.remove('ns-sec-dragover');
+    }
+  }
+
+  function onDocPointerUp(e) {
+    if (!isDragging) return;
+    isDragging = false;
+    document.removeEventListener('pointermove', onDocPointerMove);
+    document.removeEventListener('pointerup', onDocPointerUp);
+    document.body.classList.remove('ns-dragging-active');
+
+    // 找松开位置下方的节
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const sec = el?.closest?.('.ns-section');
+    root.querySelectorAll('.ns-section').forEach((s) => s.classList.remove('ns-sec-dragover'));
+
+    if (!sec) { dragSrcAi = -1; dragSrcSi = -1; return; }
+    const tAi = Number(sec.dataset.a);
+    const tSi = Number(sec.dataset.s);
+    if (dragSrcAi === -1 || (dragSrcAi === tAi && dragSrcSi === tSi)) { dragSrcAi = -1; dragSrcSi = -1; return; }
+    if (dragSrcAi !== tAi) { toast('节只能在同一章内排序'); dragSrcAi = -1; dragSrcSi = -1; return; }
+    const secs = getSec(tAi);
+    if (!secs || dragSrcSi >= secs.length || tSi >= secs.length) { dragSrcAi = -1; dragSrcSi = -1; return; }
+    // 锁定节不可参与排序
+    if (isSectionLocked(secs[dragSrcSi])) { toast('锁定节不可排序'); dragSrcAi = -1; dragSrcSi = -1; return; }
+    if (isSectionLocked(secs[tSi])) { toast('锁定节不可排序'); dragSrcAi = -1; dragSrcSi = -1; return; }
+    const fromSi = dragSrcSi;
+    const toSi = tSi;
+    dragSrcAi = -1; dragSrcSi = -1;
+    const moved = secs.splice(fromSi, 1)[0];
+    secs.splice(toSi, 0, moved);
+    log.info(`节排序: 章${tAi + 1} 第${fromSi + 1}节 → 第${toSi + 1}节`);
+    save();
+    rerender();
+  }
+
+  // ── attachToSections: 每次重绘后给手柄绑 pointerdown ──────────────────
+  const handleListeners = [];
+
+  function cleanupHandles() {
+    handleListeners.forEach(({ el, type, fn }) => el.removeEventListener(type, fn));
+    handleListeners.length = 0;
+  }
+
+  function attachToSections() {
+    cleanupHandles();
+    const handles = root.querySelectorAll('.ns-drag-handle');
+    handles.forEach((handle) => {
+      const sec = handle.closest('.ns-section');
+      if (!sec) return;
+      const ai = Number(sec.dataset.a);
+      const si = Number(sec.dataset.s);
+      if (isNaN(ai) || isNaN(si)) return;
+
+      const onPointerDown = (e) => {
+        // 锁定节不可拖拽
+        const secData = getSec(ai);
+        if (secData && isSectionLocked(secData[si])) return;
+        isDragging = true;
+        dragSrcAi = ai;
+        dragSrcSi = si;
+        pointerId = e.pointerId;
+        e.preventDefault(); // 阻止文字选中等默认行为
+        document.body.classList.add('ns-dragging-active');
+        document.addEventListener('pointermove', onDocPointerMove, { passive: true });
+        document.addEventListener('pointerup', onDocPointerUp, { passive: true });
+        log.debug(`拖拽开始: 章${ai + 1} 第${si + 1}节`);
+      };
+
+      handle.addEventListener('pointerdown', onPointerDown);
+      handleListeners.push({ el: handle, type: 'pointerdown', fn: onPointerDown });
     });
-    return typeof result === 'string' ? result : (result?.content ?? String(result ?? ''));
+    log.debug(`节拖拽绑定: ${handles.length} 个手柄 (${containerSel})`);
   }
-  const ctx = getST();
-  if (ctx && typeof ctx.generateRaw === 'function') {
-    const result = await ctx.generateRaw({ prompt: user, systemPrompt: system, prefill: '' });
-    return typeof result === 'string' ? result : String(result ?? '');
+
+  attachToSections();
+
+  const fullCleanup = () => {
+    cleanupHandles();
+    document.removeEventListener('pointermove', onDocPointerMove);
+    document.removeEventListener('pointerup', onDocPointerUp);
+  };
+  $root.data('drag-cleanup', fullCleanup);
+  $root.data('drag-attach', attachToSections);
+  return attachToSections;
+}
+
+/** 判断错误/状态是否属于可重试的瞬时故障(504/502/503/超时/网络等)。 */
+function isRetryableError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  return (
+    /\b(408|429|500|502|503|504)\b/.test(msg) ||
+    msg.includes('timeout') ||
+    msg.includes('timed out') ||
+    msg.includes('gateway') ||
+    msg.includes('network') ||
+    msg.includes('fetch') ||
+    msg.includes('econnreset') ||
+    msg.includes('socket') ||
+    msg.includes('abort')
+  );
+}
+
+/** 判断生成结果是否为"空回复"(需要重试)。 */
+function isEmptyReply(text) {
+  const t = String(text ?? '').trim();
+  return t.length < 2; // 空或过短视为空回复
+}
+
+/** 单次生成(不含重试)。带超时保护。 */
+async function _genOnce({ system, user }, gid) {
+  const timeoutMs = getSettings().genTimeoutMs || 180000;
+  const th = getTavernHelper();
+
+  const doGen = async () => {
+    if (th && typeof th.generateRaw === 'function') {
+      const result = await th.generateRaw({
+        ordered_prompts: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+        should_stream: false,
+        should_silence: true,
+        generation_id: gid,
+      });
+      return typeof result === 'string' ? result : (result?.content ?? String(result ?? ''));
+    }
+    const ctx = getST();
+    if (ctx && typeof ctx.generateRaw === 'function') {
+      const result = await ctx.generateRaw({ prompt: user, systemPrompt: system, prefill: '' });
+      return typeof result === 'string' ? result : String(result ?? '');
+    }
+    throw new Error('无可用生成接口(TavernHelper.generateRaw / 原生 generateRaw 均不可用)');
+  };
+
+  // 超时竞速: 超时视为可重试错误
+  let timer;
+  const timeoutP = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`生成超时(${timeoutMs}ms) timeout`)), timeoutMs);
+  });
+  try {
+    return await Promise.race([doGen(), timeoutP]);
+  } finally {
+    clearTimeout(timer);
   }
-  throw new Error('无可用生成接口(TavernHelper.generateRaw / 原生 generateRaw 均不可用)');
+}
+
+/**
+ * 生成(含重试)。504/502/503/超时/网络错误/空回复 → 指数退避重试。
+ * @param {()=>boolean} shouldCancel 可选，返回 true 时中止重试。
+ */
+async function novelGenerateWithId({ system, user }, gid, shouldCancel) {
+  const s = getSettings();
+  const maxRetries = Math.max(0, s.genMaxRetries ?? 3);
+  const baseMs = s.genRetryBaseMs || 1500;
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (shouldCancel?.()) throw new Error('已中止');
+    try {
+      const text = await _genOnce({ system, user }, gid);
+      if (isEmptyReply(text)) {
+        // 空回复：视为可重试
+        if (attempt < maxRetries) {
+          lastErr = new Error('空回复');
+          log.warn(`生成得到空回复, 第 ${attempt + 1} 次重试…`);
+        } else {
+          log.warn('生成多次空回复, 返回空串');
+          return '';
+        }
+      } else {
+        if (attempt > 0) log.info(`生成在第 ${attempt + 1} 次尝试成功`);
+        return text;
+      }
+    } catch (e) {
+      lastErr = e;
+      const retryable = isRetryableError(e);
+      log.warn(`生成失败(第 ${attempt + 1} 次): ${e.message}${retryable ? ' [可重试]' : ' [不可重试]'}`);
+      if (!retryable || attempt >= maxRetries) {
+        throw e; // 不可重试或已用尽次数
+      }
+    }
+    // 指数退避 + 抖动
+    if (attempt < maxRetries) {
+      const delay = baseMs * Math.pow(2, attempt) + Math.floor(Math.random() * 500);
+      log.info(`${delay}ms 后重试(${attempt + 2}/${maxRetries + 1})…`);
+      // 分段等待以便及时响应中止
+      const step = 200;
+      for (let waited = 0; waited < delay; waited += step) {
+        if (shouldCancel?.()) throw new Error('已中止');
+        await sleep(Math.min(step, delay - waited));
+      }
+    }
+  }
+  throw lastErr || new Error('生成失败');
 }
 
 async function novelGenerate({ system, user }) {
   const gid = `novel_${Date.now()}`;
   novelState.currentGenId = gid;
-  return novelGenerateWithId({ system, user }, gid);
+  return novelGenerateWithId({ system, user }, gid, () => novelState.cancelRequested);
 }
 
 function stopNovelGeneration() {
@@ -743,11 +998,16 @@ function parseSummary(text) {
 /* ---------------------------- 节生成流程 ---------------------------- */
 
 /** 生成某一节正文; flatIdx 为该节在展平序列中的下标(用于动画高亮)。 */
-async function generateSection(proj, actIdx, secIdx, flatIdx, onProgress) {
+/** skipSummary=true 时跳过触发总结(单节重新生成时使用, 避免干扰生成流程) */
+async function generateSection(proj, actIdx, secIdx, flatIdx, onProgress, { skipSummary = false } = {}) {
   const act = proj.acts[actIdx];
   const sec = act.sections[secIdx];
-  // 开始写"某章第一节"时, 先对之前所有已完成但未总结的章做整章总结
-  if (secIdx === 0) await summarizePendingActs(proj, actIdx, onProgress);
+  if (isSectionLocked(sec)) {
+    log.warn(`第 ${actIdx + 1} 章 第 ${secIdx + 1} 节已锁定，跳过生成`);
+    return '';
+  }
+  // 开始写"某章第一节"时, 先对之前所有已完成但未总结的章做整章总结(重新生成时跳过)
+  if (secIdx === 0 && !skipSummary) await summarizePendingActs(proj, actIdx, onProgress);
   const { system, user } = buildSectionPrompt(proj, actIdx, secIdx, flatIdx);
   onProgress?.(`正在生成第 ${actIdx + 1} 章 第 ${secIdx + 1} 节…`, true);
   novelState.activeFlatIdx = flatIdx;
@@ -896,7 +1156,7 @@ async function analyzeChunk(chunkText, index, totalChunks) {
   const gid = `analyze_${Date.now()}_${index}`;
   analyzeState.genIds.add(gid);
   try {
-    return (await novelGenerateWithId({ system, user }, gid)).trim();
+    return (await novelGenerateWithId({ system, user }, gid, () => analyzeState.cancelRequested)).trim();
   } finally {
     analyzeState.genIds.delete(gid);
   }
@@ -961,7 +1221,7 @@ async function mergeGroup(group, isFinal) {
   const gid = `aggregate_${Date.now()}`;
   analyzeState.genIds.add(gid);
   try {
-    return (await novelGenerateWithId({ system, user }, gid)).trim();
+    return (await novelGenerateWithId({ system, user }, gid, () => analyzeState.cancelRequested)).trim();
   } finally {
     analyzeState.genIds.delete(gid);
   }
@@ -1060,6 +1320,7 @@ async function runAnalysis({ text, title }, onProgress) {
 /* ================================================================== */
 
 const contState = { generating: false, cancelRequested: false, currentGenId: '', activeFlatIdx: -1, activeActIdx: -1 };
+let _contDragAttach = null; // 续写节拖拽重绑函数
 
 /** 获取所有续写会话列表。 */
 function getContinuations() {
@@ -1195,12 +1456,16 @@ function resetAllContent() {
   log.info('已清空所有内容');
 }
 
-/** 生成续写某一节。 */
-async function generateContSection(cont, actIdx, secIdx, flatIdx, mode, onProgress) {
+/** skipSummary=true 时跳过触发总结(单节重新生成时使用) */
+async function generateContSection(cont, actIdx, secIdx, flatIdx, mode, onProgress, { skipSummary = false } = {}) {
   const act = cont.acts[actIdx];
   const sec = act.sections[secIdx];
-  // 开始写"某章第一节"时, 先对之前已完成但未总结的章做整章总结
-  if (secIdx === 0) await summarizePendingContActs(cont, actIdx, onProgress);
+  if (isSectionLocked(sec)) {
+    log.warn(`续写第 ${actIdx + 1} 章 第 ${secIdx + 1} 节已锁定，跳过生成`);
+    return '';
+  }
+  // 开始写"某章第一节"时, 先对之前已完成但未总结的章做整章总结(重新生成时跳过)
+  if (secIdx === 0 && !skipSummary) await summarizePendingContActs(cont, actIdx, onProgress);
   const { system, user } = buildContSectionPrompt(cont, actIdx, secIdx, flatIdx, mode);
   onProgress?.(`正在续写第 ${actIdx + 1} 章 第 ${secIdx + 1} 节…`, true);
   const gid = `cont_${Date.now()}_${flatIdx}`;
@@ -1209,7 +1474,7 @@ async function generateContSection(cont, actIdx, secIdx, flatIdx, mode, onProgre
   contState.activeActIdx = actIdx; // 记住当前操作章, 该章不自动折叠
   renderContinuationChapters();
   try {
-    const text = (await novelGenerateWithId({ system, user }, gid)).trim();
+    const text = (await novelGenerateWithId({ system, user }, gid, () => contState.cancelRequested)).trim();
     sec.content = text;
     sec.done = true;
     sec.updatedAt = Date.now();
@@ -1243,7 +1508,7 @@ async function maybeSummarizeContAct(cont, actIdx, onProgress) {
     log.info(`开始生成续写第 ${actNo} 章整章表格总结…`);
     onProgress?.(`正在为续写第 ${actNo} 章生成整章表格总结…`, true);
     const { system, user } = buildActSummaryPrompt(cont, actIdx);
-    const raw = (await novelGenerateWithId({ system, user }, `cont_sum_${Date.now()}`)).trim();
+    const raw = (await novelGenerateWithId({ system, user }, `cont_sum_${Date.now()}`, () => contState.cancelRequested)).trim();
     log.debug(`续写第 ${actNo} 章总结原始返回:`, raw.slice(0, 200));
     const parsed = parseSummary(raw);
     if (!parsed.characters.length && !parsed.plot.length) {
@@ -1286,6 +1551,7 @@ async function withContGenerating(fn) {
     contState.generating = false;
     contState.cancelRequested = false;
     contState.currentGenId = '';
+    contState.activeActIdx = -1; // 生成结束后清除，避免后续重绘强制展开该章
     $?.(`#${EXT_ID}-analyze [data-act="ct-stop"]`).prop('disabled', true);
   }
 }
@@ -1295,17 +1561,19 @@ async function withContGenerating(fn) {
 function resetContSections(cont) {
   if ((cont.mode || 'outline') === 'free') {
     cont.acts = [];
+    cont.summaries = [];
   } else {
     for (const act of cont.acts || []) {
       for (const sec of act.sections || []) {
+        if (isSectionLocked(sec)) continue; // 跳过锁定节
         sec.content = '';
         sec.done = false;
         sec.updatedAt = 0;
       }
       delete act._folded;
     }
+    if (!flatSections(cont).some((f) => f.sec.locked)) cont.summaries = [];
   }
-  cont.summaries = [];
   contState.activeActIdx = -1;
   saveContinuation();
 }
@@ -1459,7 +1727,7 @@ function ensurePanel() {
           </div>
           <div class="ns-card" id="${EXT_ID}-idea"></div>
         </div>
-        <div class="ns-panel__footer"><span class="ns-muted">${EXT_NAME} v1.9</span></div>
+        <div class="ns-panel__footer"><span class="ns-muted">${EXT_NAME} v2.0</span></div>
       </div>
     </div>`;
   $('body').append(html);
@@ -1541,11 +1809,21 @@ function fillKeywordForm() {
 }
 
 /** 每次打开面板时，把两个主模块重置为折叠状态。 */
+/** 打开面板时折叠所有模块，并重置章级折叠状态（让重绘时按默认规则重新计算）。 */
 function collapseAllModules() {
   const $ = globalThis.jQuery;
   if (!$) return;
   $(`#${EXT_ID}-analyze-body, #${EXT_ID}-novel-body`).css('display', 'none');
   $('[data-act="module-fold"] .ns-module-icon').removeClass('ns-module-icon--open');
+  // 重置写新小说所有章的折叠状态（清除 _folded，下次渲染按默认规则重算）
+  const proj = getActiveProject();
+  if (proj) for (const act of proj.acts || []) delete act._folded;
+  // 重置续写所有章的折叠状态
+  const cont = getContinuation();
+  if (cont) for (const act of cont.acts || []) delete act._folded;
+  // 重置 activeActIdx
+  novelState.activeActIdx = -1;
+  contState.activeActIdx = -1;
 }
 
 function openPanel() {
@@ -1553,10 +1831,23 @@ function openPanel() {
   if (!$overlay) return;
   refreshStatus();
   fillKeywordForm();
+  // 节拖拽排序 — 必须先绑再 render，render 末尾会调 attach 绑定节
+  _novelDragAttach = bindSectionDrag(
+    `#${EXT_ID}-novel`,
+    (ai) => { const proj = getActiveProject(); return proj?.acts[ai]?.sections; },
+    () => { const proj = getActiveProject(); if (proj) touchProject(proj); },
+    () => renderNovelChapters(),
+  );
+  _contDragAttach = bindSectionDrag(
+    `#${EXT_ID}-analyze`,
+    (ai) => { const cont = getContinuation(); return cont?.acts[ai]?.sections; },
+    () => saveContinuation(),
+    () => renderContinuationChapters(),
+  );
   bindAnalyzeEvents();
-  renderAnalyzeUI();
+  renderAnalyzeUI();    // renderAnalyzeUI 末尾调 _contDragAttach() 绑节
   bindNovelEvents();
-  renderNovelUI();
+  renderNovelUI();      // renderNovelUI 末尾调 _novelDragAttach() 绑节
   bindIdeaEvents();
   renderIdeaUI();
   collapseAllModules(); // 每次打开默认折叠所有模块
@@ -1649,6 +1940,7 @@ function renderAnalyzeUI() {
     </div>
     <div class="ns-field" id="${EXT_ID}-az-result">${renderAnalyzeResult()}</div>
   `);
+  _contDragAttach?.(); // 整块重绘后重新绑定拖拽
 }
 
 function renderAnalyzeResult() {
@@ -1696,22 +1988,26 @@ function contChapterListHtml(cont) {
             : `<span class="ns-tag ${sec.done ? 'ns-tag--done' : ''}">${sec.done ? '已生成' : '未生成'}</span>`;
           const outlineField =
             mode === 'outline'
-              ? `<input type="text" class="ns-ct-sec-outline" data-a="${ai}" data-s="${si}" value="${esc(sec.outline || '')}" placeholder="本节大纲…" />`
+              ? `<textarea class="ns-ct-sec-outline" data-a="${ai}" data-s="${si}" rows="1" placeholder="本节大纲…">${esc(sec.outline || '')}</textarea>`
               : `<span class="ns-chapter__outline">${esc(sec.outline || '')}</span>`;
+          const locked = isSectionLocked(sec);
+          const dragHandle = mode === 'outline' && !locked ? `<span class="ns-drag-handle" title="拖拽排序"><i class="fa-solid fa-grip-lines"></i></span>` : (locked ? '<span class="ns-lock-icon" title="已锁定"><i class="fa-solid fa-lock"></i></span>' : '');
           return `
-            <div class="ns-section ${generating ? 'ns-chapter--gen' : ''}">
+            <div class="ns-section ${generating ? 'ns-chapter--gen' : ''} ${locked ? 'ns-sec-locked' : ''}" data-a="${ai}" data-s="${si}">
               <div class="ns-chapter__head">
+                ${dragHandle}
                 <strong>第 ${si + 1} 节</strong>${tag}${outlineField}
               </div>
               ${genBlock}
               ${sec.content ? `<div class="ns-chapter__body">${preview}<span class="ns-wordcount">${sec.content.length} 字</span></div>` : ''}
               <div class="ns-chapter__actions">
-                ${sec.content ? `<button class="ns-btn ns-btn--sm" data-act="ct-gen-sec" data-a="${ai}" data-s="${si}" ${contState.generating ? 'disabled' : ''}>重新生成</button>` : ''}
+                ${!locked && sec.done ? `<button class="ns-btn ns-btn--sm" data-act="ct-gen-sec" data-a="${ai}" data-s="${si}" ${contState.generating ? 'disabled' : ''}>重新生成</button>` : ''}
                 ${sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="ct-view-sec" data-a="${ai}" data-s="${si}">查看全文</button>` : ''}
                 ${sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="ct-copy-sec" data-a="${ai}" data-s="${si}"><i class="fa-solid fa-copy"></i> 复制</button>` : ''}
                 <span class="ns-chapter__actions-right">
-                  ${sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="ct-sec-clear" data-a="${ai}" data-s="${si}" title="清空本节正文">清空</button>` : ''}
-                  <button class="ns-btn ns-btn--icon ns-btn--sm ns-btn--danger" data-act="ct-sec-del" data-a="${ai}" data-s="${si}" title="删除本节"><i class="fa-solid fa-trash"></i></button>
+                  <button class="ns-btn ns-btn--icon ns-btn--sm ${locked ? 'ns-btn--ghost' : ''}" data-act="${locked ? 'ct-sec-unlock' : 'ct-sec-lock'}" data-a="${ai}" data-s="${si}" title="${locked ? '解锁本节及之后所有节' : '锁定本节及之前所有节'}"><i class="fa-solid fa-${locked ? 'lock-open' : 'lock'}"></i></button>
+                  ${!locked && sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="ct-sec-clear" data-a="${ai}" data-s="${si}" title="清空本节正文">清空</button>` : ''}
+                  ${!locked ? `<button class="ns-btn ns-btn--icon ns-btn--sm ns-btn--danger" data-act="ct-sec-del" data-a="${ai}" data-s="${si}" title="删除本节"><i class="fa-solid fa-trash"></i></button>` : ''}
                 </span>
               </div>
             </div>`;
@@ -1755,7 +2051,10 @@ function renderContinuationChapters() {
   const cont = getContinuation();
   if (!cont) return;
   const $list = $(`#${EXT_ID}-analyze .ns-chapters`);
-  if ($list.length) $list.html(contChapterListHtml(cont));
+  if ($list.length) {
+    $list.html(contChapterListHtml(cont));
+    _contDragAttach?.(); // 重绘后重新绑定拖拽
+  }
 }
 
 /** 从 DOM 收集续写章-节结构(仅大纲模式有可编辑字段)。 */
@@ -2036,6 +2335,26 @@ function bindAnalyzeEvents() {
           }
         }
         return;
+      case 'ct-sec-lock':
+        if (cont) {
+          const ai = Number($(this).data('a'));
+          const si = Number($(this).data('s'));
+          lockUpToSection(cont, ai, si);
+          saveContinuation();
+          renderContinuationChapters();
+          toast(`已锁定第 ${ai + 1} 章 第 ${si + 1} 节及之前所有内容`);
+        }
+        return;
+      case 'ct-sec-unlock':
+        if (cont) {
+          const ai = Number($(this).data('a'));
+          const si = Number($(this).data('s'));
+          unlockFromSection(cont, ai, si);
+          saveContinuation();
+          renderContinuationChapters();
+          toast(`已解锁第 ${ai + 1} 章 第 ${si + 1} 节及之后所有内容`);
+        }
+        return;
       case 'ct-sec-del':
         if (cont) {
           const ai = Number($(this).data('a'));
@@ -2130,11 +2449,15 @@ function bindAnalyzeEvents() {
           const si = Number($(this).data('s'));
           if (Number.isInteger(ai) && Number.isInteger(si) && cont.acts[ai]?.sections[si]) {
             collectContActsFromDOM(cont);
+            // 重新生成前先重置该节状态
+            const secToRegen = cont.acts[ai].sections[si];
+            secToRegen.done = false;
+            secToRegen.content = '';
             const flat = flatSections(cont);
             const f = flat.find((x) => x.actIdx === ai && x.secIdx === si);
             await withContGenerating(async () => {
-              await generateContSection(cont, ai, si, f ? f.flatIdx : -1, cont.mode || 'outline', setContHint);
-              setContHint(`第 ${ai + 1} 章 第 ${si + 1} 节已生成。`);
+              await generateContSection(cont, ai, si, f ? f.flatIdx : -1, cont.mode || 'outline', setContHint, { skipSummary: true });
+              setContHint(`第 ${ai + 1} 章 第 ${si + 1} 节已重新生成。`);
             });
             renderAnalyzeUI();
           }
@@ -2465,7 +2788,7 @@ function renderEntityRows(entities) {
       (item, i) => `
       <div class="ns-outline-row">
         <span class="ns-outline-no"><i class="fa-solid fa-user-pen"></i></span>
-        <input type="text" class="ns-entity-input" value="${esc(item)}" placeholder="如：林川-主角，冷静果断，持有断罪之剑" />
+        <textarea class="ns-entity-input" rows="1" placeholder="如：林川-主角，冷静果断，持有断罪之剑">${esc(item)}</textarea>
         <button class="ns-btn ns-btn--icon ns-btn--sm" data-act="entity-del" data-idx="${i}" title="删除本行"><i class="fa-solid fa-trash"></i></button>
       </div>`,
     )
@@ -2514,22 +2837,25 @@ function novelChapterListHtml(proj) {
           const tag = generating
             ? `<span class="ns-tag ns-tag--gen">生成中</span>`
             : `<span class="ns-tag ${sec.done ? 'ns-tag--done' : ''}">${sec.done ? '已生成' : '未生成'}</span>`;
+          const locked = isSectionLocked(sec);
           return `
-            <div class="ns-section ${generating ? 'ns-chapter--gen' : ''}">
+            <div class="ns-section ${generating ? 'ns-chapter--gen' : ''} ${locked ? 'ns-sec-locked' : ''}" data-a="${ai}" data-s="${si}">
               <div class="ns-chapter__head">
+                ${locked ? '<span class="ns-lock-icon" title="已锁定"><i class="fa-solid fa-lock"></i></span>' : `<span class="ns-drag-handle" title="拖拽排序"><i class="fa-solid fa-grip-lines"></i></span>`}
                 <strong>第 ${si + 1} 节</strong>
                 ${tag}
-                <input type="text" class="ns-sec-outline" data-a="${ai}" data-s="${si}" value="${esc(sec.outline || '')}" placeholder="本节大纲…" />
+                <textarea class="ns-sec-outline" data-a="${ai}" data-s="${si}" rows="1" placeholder="本节大纲…">${esc(sec.outline || '')}</textarea>
               </div>
               ${genBlock}
               ${sec.content ? `<div class="ns-chapter__body">${preview}<span class="ns-wordcount">${sec.content.length} 字</span></div>` : ''}
               <div class="ns-chapter__actions">
-                ${sec.content ? `<button class="ns-btn ns-btn--sm" data-act="gen-sec" data-a="${ai}" data-s="${si}" ${novelState.generating ? 'disabled' : ''}>重新生成</button>` : ''}
+                ${!locked && sec.done ? `<button class="ns-btn ns-btn--sm" data-act="gen-sec" data-a="${ai}" data-s="${si}" ${novelState.generating ? 'disabled' : ''}>重新生成</button>` : ''}
                 ${sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="view-sec" data-a="${ai}" data-s="${si}">查看全文</button>` : ''}
                 ${sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="copy-sec" data-a="${ai}" data-s="${si}"><i class="fa-solid fa-copy"></i> 复制</button>` : ''}
                 <span class="ns-chapter__actions-right">
-                  ${sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="sec-clear" data-a="${ai}" data-s="${si}" title="清空本节正文">清空</button>` : ''}
-                  <button class="ns-btn ns-btn--icon ns-btn--sm ns-btn--danger" data-act="sec-del" data-a="${ai}" data-s="${si}" title="删除本节"><i class="fa-solid fa-trash"></i></button>
+                  <button class="ns-btn ns-btn--icon ns-btn--sm ${locked ? 'ns-btn--ghost' : ''}" data-act="${locked ? 'sec-unlock' : 'sec-lock'}" data-a="${ai}" data-s="${si}" title="${locked ? '解锁本节及之后所有节' : '锁定本节及之前所有节'}"><i class="fa-solid fa-${locked ? 'lock-open' : 'lock'}"></i></button>
+                  ${!locked && sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="sec-clear" data-a="${ai}" data-s="${si}" title="清空本节正文">清空</button>` : ''}
+                  ${!locked ? `<button class="ns-btn ns-btn--icon ns-btn--sm ns-btn--danger" data-act="sec-del" data-a="${ai}" data-s="${si}" title="删除本节"><i class="fa-solid fa-trash"></i></button>` : ''}
                 </span>
               </div>
             </div>`;
@@ -2564,7 +2890,10 @@ function renderNovelChapters() {
   const proj = getActiveProject();
   if (!proj) return;
   const $list = $(`#${EXT_ID}-novel .ns-chapters`);
-  if ($list.length) $list.html(novelChapterListHtml(proj));
+  if ($list.length) {
+    $list.html(novelChapterListHtml(proj));
+    _novelDragAttach?.(); // 重绘后重新绑定拖拽
+  }
 }
 
 /** 只刷新写小说总结区。 */
@@ -2713,6 +3042,7 @@ function renderNovelUI() {
       </div>
     </div>
     ${body}`);
+  _novelDragAttach?.(); // 整块重绘后重新绑定拖拽
 }
 
 /** 渲染大总结折叠块(默认折叠)。 */
@@ -2791,13 +3121,15 @@ async function regenAllContSummaries(cont, onProgress) {
 function resetProjSections(proj) {
   for (const act of proj.acts || []) {
     for (const sec of act.sections || []) {
+      if (isSectionLocked(sec)) continue; // 跳过锁定节
       sec.content = '';
       sec.done = false;
       sec.updatedAt = 0;
     }
     delete act._folded;
   }
-  proj.summaries = [];
+  // 若有锁定节，不清空总结（锁定内容的总结需保留）
+  if (!flatSections(proj).some((f) => f.sec.locked)) proj.summaries = [];
   novelState.activeActIdx = -1;
   touchProject(proj);
 }
@@ -2871,6 +3203,7 @@ async function withGenerating(fn) {
     novelState.generating = false;
     novelState.cancelRequested = false;
     novelState.currentGenId = '';
+    novelState.activeActIdx = -1; // 生成结束后清除，避免后续重绘强制展开该章
     $?.(`#${EXT_ID}-novel [data-act="stop"]`).prop('disabled', true);
   }
 }
@@ -2962,6 +3295,26 @@ function bindNovelEvents() {
             touchProject(proj);
             renderNovelChapters();
           }
+        }
+        break;
+      case 'sec-lock':
+        if (proj) {
+          const ai = Number($(this).data('a'));
+          const si = Number($(this).data('s'));
+          lockUpToSection(proj, ai, si);
+          touchProject(proj);
+          renderNovelChapters();
+          toast(`已锁定第 ${ai + 1} 章 第 ${si + 1} 节及之前所有内容`);
+        }
+        break;
+      case 'sec-unlock':
+        if (proj) {
+          const ai = Number($(this).data('a'));
+          const si = Number($(this).data('s'));
+          unlockFromSection(proj, ai, si);
+          touchProject(proj);
+          renderNovelChapters();
+          toast(`已解锁第 ${ai + 1} 章 第 ${si + 1} 节及之后所有内容`);
         }
         break;
       case 'sec-del':
@@ -3067,11 +3420,16 @@ function bindNovelEvents() {
           const si = Number($(this).data('s'));
           if (Number.isInteger(ai) && Number.isInteger(si) && proj.acts[ai]?.sections[si]) {
             collectActsFromDOM(proj);
+            // 重新生成前先重置该节状态，确保覆写
+            const secToRegen = proj.acts[ai].sections[si];
+            secToRegen.done = false;
+            secToRegen.content = '';
             const flat = flatSections(proj);
             const f = flat.find((x) => x.actIdx === ai && x.secIdx === si);
             await withGenerating(async () => {
-              await generateSection(proj, ai, si, f ? f.flatIdx : -1, setNovelHint);
-              setNovelHint(`第 ${ai + 1} 章 第 ${si + 1} 节已生成。`);
+              // skipSummary=true 跳过总结触发，单节重生不影响总结流程
+              await generateSection(proj, ai, si, f ? f.flatIdx : -1, setNovelHint, { skipSummary: true });
+              setNovelHint(`第 ${ai + 1} 章 第 ${si + 1} 节已重新生成。`);
             });
             renderNovelUI();
           }
