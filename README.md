@@ -1,4 +1,4 @@
-# Novel Studio 小说工坊 (v1.9)
+# Novel Studio 小说工坊
 
 一个 **SillyTavern / TauriTavern 第三方扩展** 的调试骨架。依赖node.js,是用前请先安装依赖,
 当前版本只做一件事：
