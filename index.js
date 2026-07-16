@@ -322,6 +322,35 @@ function safeFileName(name) {
 const novelState = { generating: false, cancelRequested: false, currentGenId: '', activeFlatIdx: -1, activeActIdx: -1 };
 let _novelDragAttach = null; // 写小说节拖拽重绑函数
 
+/**
+ * 面板折叠状态。默认全部折叠；仅用户手动点击会改变，重绘/开关面板不自动改。
+ * modules.* = true 表示主模块展开；open[key] = true 表示对应子折叠块展开。
+ */
+const uiFoldState = {
+  modules: { analyze: false, novel: false },
+  open: Object.create(null),
+};
+
+function isUiOpen(key) {
+  return !!uiFoldState.open[key];
+}
+function setUiOpen(key, open) {
+  if (!key) return;
+  if (open) uiFoldState.open[key] = true;
+  else delete uiFoldState.open[key];
+}
+/** 章折叠：未手动设置过则默认折叠。 */
+function isActFolded(act) {
+  return typeof act?._folded === 'boolean' ? act._folded : true;
+}
+/** 折叠头/身 HTML 辅助（根据 uiFoldState 决定展开）。 */
+function foldIconClass(key) {
+  return isUiOpen(key) ? 'ns-collapse__icon ns-collapse__icon--open' : 'ns-collapse__icon';
+}
+function foldBodyStyle(key) {
+  return isUiOpen(key) ? '' : ' style="display:none;"';
+}
+
 /* ---------------------------- 项目 CRUD ---------------------------- */
 
 function getProjects() {
@@ -330,10 +359,29 @@ function getProjects() {
   return s.projects;
 }
 
+/** 确保项目有 worldDefs 结构，并迁移旧 entities 字段。 */
+function ensureWorldDefs(proj) {
+  if (!proj) return;
+  if (!proj.worldDefs) {
+    proj.worldDefs = { chars: [], items: [], places: [], others: [], preload: false };
+  }
+  const wd = proj.worldDefs;
+  if (!Array.isArray(wd.chars)) wd.chars = [];
+  if (!Array.isArray(wd.items)) wd.items = [];
+  if (!Array.isArray(wd.places)) wd.places = [];
+  if (!Array.isArray(wd.others)) wd.others = [];
+  if (typeof wd.preload !== 'boolean') wd.preload = false;
+  // 迁移旧 entities
+  if (Array.isArray(proj.entities) && proj.entities.length && !wd.chars.length) {
+    wd.chars = proj.entities.filter(Boolean);
+    proj.entities = [];
+  }
+}
+
 function getActiveProject() {
   const s = getSettings();
   const proj = getProjects().find((p) => p.id === s.activeProjectId) || null;
-  if (proj) ensureActs(proj);
+  if (proj) { ensureActs(proj); ensureWorldDefs(proj); }
   return proj;
 }
 
@@ -343,7 +391,8 @@ function makeProject(title, source = 'manual') {
     id: genId(),
     title: title || `未命名小说 ${new Date(now).toLocaleString()}`,
     background: '',
-    entities: [], // 人物/道具设定
+    entities: [], // 旧版兼容字段(迁移后为空)
+    worldDefs: { chars: [], items: [], places: [], others: [], preload: false }, // 世界设定分类
     acts: [], // 章-节层次结构 Act[]
     summaries: [], // 每大章一条表格总结
     analysis: null,
@@ -363,7 +412,7 @@ function makeSection(outline = '') {
   return { id: genId(), outline: String(outline || ''), content: '', done: false, updatedAt: 0 };
 }
 function makeAct(title = '', overview = '') {
-  return { id: genId(), title: String(title || ''), overview: String(overview || ''), sections: [] };
+  return { id: genId(), title: String(title || ''), overview: String(overview || ''), sections: [], _folded: true };
 }
 
 /**
@@ -821,11 +870,32 @@ function summaryToTable(s) {
   return lines.join('\n');
 }
 
-/** 人物/道具设定文本块。 */
+/** 把 worldDefs 的四个板块拼成设定文本块（注入 prompt）。 */
 function entitiesText(proj) {
-  const list = Array.isArray(proj.entities) ? proj.entities.filter((e) => e && e.trim()) : [];
-  if (!list.length) return '';
-  return `【人物与道具设定】\n${list.map((e) => `- ${e.trim()}`).join('\n')}`;
+  const wd = proj.worldDefs || {};
+  const sections = [
+    { key: 'chars',  label: '人物设定' },
+    { key: 'items',  label: '道具设定' },
+    { key: 'places', label: '地理设定' },
+    { key: 'others', label: '其他设定' },
+  ];
+  const parts = [];
+  for (const { key, label } of sections) {
+    const list = (wd[key] || []).filter((e) => e && e.trim());
+    if (list.length) parts.push(`【${label}】\n${list.map((e) => `- ${e.trim()}`).join('\n')}`);
+  }
+  return parts.join('\n\n');
+}
+
+/** 若 worldDefs.preload=true，把所有设定文本 + 最新总结作为全局预读取文本（注入 system）。 */
+function preloadWorldDefsText(proj) {
+  const wd = proj?.worldDefs;
+  if (!wd || !wd.preload) return '';
+  const defs = entitiesText(proj);
+  const summary = buildGrandSummary(proj);
+  const parts = [defs, summary].filter(Boolean);
+  if (!parts.length) return '';
+  return `【全局预读取 · 世界设定与记忆】\n${parts.join('\n\n')}`;
 }
 
 /** 构建"写某一节"的提示词: 先预读所属章总览, 再写本节。 */
@@ -836,22 +906,24 @@ function buildSectionPrompt(proj, actIdx, secIdx, flatIdx) {
   // ── System: 预设 → 全局提示词 → 写作助手说明 ──
   const presetSys = readSysPrompt();
   const globalKw = readGlobalKeyword();
+  const preloadText = preloadWorldDefsText(proj); // worldDefs.preload 开启时带入 system
   const system = [
-    presetSys || null,   // 1. 预设 System Prompt（最高优先级）
-    globalKw || null,    // 2. 全局提示词
-    '你是专业的中文小说写作助手。本作品按"章-节"结构编写。', // 3. 插件写作说明
-    '请先理解【本章总览】把握本章走向，再根据【背景设定】【人物与道具设定】【长期记忆】【前文】和【本节大纲】续写本节正文。',
-    '要求：只输出本节正文，不要输出标题/大纲/解释/多余标记；严格遵守人物与道具设定；与前文及本章走向连贯；文笔流畅。',
+    presetSys || null,       // 1. 预设 System Prompt
+    globalKw || null,        // 2. 全局提示词
+    preloadText || null,     // 3. 预读取世界设定+总结（preload开启时）
+    '你是专业的中文小说写作助手。本作品按"章-节"结构编写。',
+    '请先理解【本章总览】把握本章走向，再根据【背景设定】【世界设定】【长期记忆】【前文】和【本节大纲】续写本节正文。',
+    '要求：只输出本节正文，不要输出标题/大纲/解释/多余标记；严格遵守世界设定；与前文及本章走向连贯；文笔流畅。',
   ].filter(Boolean).join('\n\n');
 
-  // ── User: 背景/设定 → 记忆(大总结) → 前文 → 章总览 → 节大纲 → 指令 ──
+  // ── User: 始终包含背景/设定/记忆（preload开启时system已有一份，user再带一份做双重保障）──
   const user = [
-    proj.background ? `【背景设定】\n${proj.background}` : '',    // 背景设定
-    entitiesText(proj),                                            // 人物/道具设定
-    buildGrandSummary(proj),                                       // 记忆（大总结）
-    recentSectionContext(proj, flatIdx, 2),                        // 前文（最近2节）
-    `【本章总览】(第${actIdx + 1}章 ${act.title || ''})\n${act.overview || '(未填写章总览)'}`,  // 章总览
-    `【本节大纲】(第${actIdx + 1}章 第${secIdx + 1}节)\n${sec.outline || ''}`,                 // 节大纲
+    proj.background ? `【背景设定】\n${proj.background}` : '',
+    entitiesText(proj),                 // 世界设定（始终注入）
+    buildGrandSummary(proj),            // 大总结记忆（始终注入）
+    recentSectionContext(proj, flatIdx, 2),
+    `【本章总览】(第${actIdx + 1}章 ${act.title || ''})\n${act.overview || '(未填写章总览)'}`,
+    `【本节大纲】(第${actIdx + 1}章 第${secIdx + 1}节)\n${sec.outline || ''}`,
     `请开始写第${actIdx + 1}章 第${secIdx + 1}节正文:`,
   ]
     .filter(Boolean)
@@ -1011,7 +1083,7 @@ async function generateSection(proj, actIdx, secIdx, flatIdx, onProgress, { skip
   const { system, user } = buildSectionPrompt(proj, actIdx, secIdx, flatIdx);
   onProgress?.(`正在生成第 ${actIdx + 1} 章 第 ${secIdx + 1} 节…`, true);
   novelState.activeFlatIdx = flatIdx;
-  novelState.activeActIdx = actIdx; // 记住当前操作章, 该章不自动折叠
+  novelState.activeActIdx = actIdx;
   renderNovelChapters();
   try {
     const text = (await novelGenerate({ system, user })).trim();
@@ -1250,6 +1322,7 @@ async function runAnalysis({ text, title }, onProgress) {
   analyzeState.running = true;
   analyzeState.cancelRequested = false;
   analyzeState.genIds.clear();
+  syncMiniBallBusy();
   const t0 = Date.now();
   try {
     onProgress?.(`共 ${full.length} 字, 切为 ${chunks.length} 段, 并发 ${concurrency}, 开始提取…`, 0);
@@ -1312,6 +1385,7 @@ async function runAnalysis({ text, title }, onProgress) {
     analyzeState.running = false;
     analyzeState.cancelRequested = false;
     analyzeState.genIds.clear();
+    syncMiniBallBusy();
   }
 }
 
@@ -1471,7 +1545,7 @@ async function generateContSection(cont, actIdx, secIdx, flatIdx, mode, onProgre
   const gid = `cont_${Date.now()}_${flatIdx}`;
   contState.currentGenId = gid;
   contState.activeFlatIdx = flatIdx;
-  contState.activeActIdx = actIdx; // 记住当前操作章, 该章不自动折叠
+  contState.activeActIdx = actIdx;
   renderContinuationChapters();
   try {
     const text = (await novelGenerateWithId({ system, user }, gid, () => contState.cancelRequested)).trim();
@@ -1531,7 +1605,7 @@ function renderContSummaries() {
   const cont = getContinuation();
   if (!cont) return;
   const $box = $(`#${EXT_ID}-analyze .ns-summaries`);
-  if ($box.length) $box.html((cont.summaries || []).map((s) => renderSummaryTable(s)).join(''));
+  if ($box.length) $box.html((cont.summaries || []).map((s) => renderSummaryTable(s, 'ct-sum')).join(''));
   // 同步刷新大总结（保留折叠状态）
   refreshGrandSummary(cont, `#${EXT_ID}-analyze`);
 }
@@ -1539,6 +1613,7 @@ function renderContSummaries() {
 async function withContGenerating(fn) {
   contState.generating = true;
   contState.cancelRequested = false;
+  syncMiniBallBusy();
   const $ = globalThis.jQuery;
   $?.(`#${EXT_ID}-analyze [data-act="ct-stop"]`).prop('disabled', false);
   try {
@@ -1551,8 +1626,9 @@ async function withContGenerating(fn) {
     contState.generating = false;
     contState.cancelRequested = false;
     contState.currentGenId = '';
-    contState.activeActIdx = -1; // 生成结束后清除，避免后续重绘强制展开该章
+    contState.activeActIdx = -1;
     $?.(`#${EXT_ID}-analyze [data-act="ct-stop"]`).prop('disabled', true);
+    syncMiniBallBusy();
   }
 }
 
@@ -1669,6 +1745,165 @@ async function runContFree(cont) {
 
 const PANEL_ID = `${EXT_ID}-panel`;
 const OVERLAY_ID = `${EXT_ID}-overlay`;
+const MINI_ID = `${EXT_ID}-mini-ball`;
+const ENTRY_FLOAT_ID = `${EXT_ID}-float-button`;
+
+/** 面板 UI 状态：最小化圆球位置等。 */
+const panelUiState = {
+  minimized: false,
+  miniPos: null, // { left, top } | null → 用默认右下角
+  _miniBound: false,
+};
+
+function isPanelBusy() {
+  let ideaBusy = false;
+  try {
+    ideaBusy = !!ideaState.generating;
+  } catch (_) {
+    /* ideaState 可能尚未初始化 */
+  }
+  return !!(novelState.generating || contState.generating || analyzeState.running || ideaBusy);
+}
+
+function setEntryFloatVisible(visible) {
+  const $ = globalThis.jQuery;
+  if (!$) return;
+  $(`#${ENTRY_FLOAT_ID}`).css('display', visible ? 'flex' : 'none');
+}
+
+function syncMiniBallBusy() {
+  const $ = globalThis.jQuery;
+  if (!$) return;
+  const $ball = $(`#${MINI_ID}`);
+  if (!$ball.length) return;
+  const busy = isPanelBusy();
+  $ball.toggleClass('ns-mini-ball--busy', busy);
+  $ball.attr('title', busy ? `${EXT_NAME} · 后台工作中（点击还原）` : `${EXT_NAME}（点击还原，可拖动）`);
+}
+
+function clampMiniPos(left, top, size = 52) {
+  const maxL = Math.max(0, window.innerWidth - size);
+  const maxT = Math.max(0, window.innerHeight - size);
+  return {
+    left: Math.max(0, Math.min(maxL, left)),
+    top: Math.max(0, Math.min(maxT, top)),
+  };
+}
+
+function ensureMiniBall() {
+  const $ = globalThis.jQuery;
+  if (!$) return null;
+  let $ball = $(`#${MINI_ID}`);
+  if ($ball.length) return $ball;
+
+  $ball = $(`
+    <div id="${MINI_ID}" class="ns-mini-ball" style="display:none;" title="${EXT_NAME}（点击还原，可拖动）">
+      <i class="fa-solid fa-feather-pointed"></i>
+      <span class="ns-mini-ball__ring" aria-hidden="true"></span>
+    </div>`);
+  $('body').append($ball);
+
+  if (!panelUiState._miniBound) {
+    panelUiState._miniBound = true;
+    let dragging = false;
+    let moved = false;
+    let startX = 0;
+    let startY = 0;
+    let origL = 0;
+    let origT = 0;
+
+    $ball.on('pointerdown', function (e) {
+      if (e.button != null && e.button !== 0) return;
+      dragging = true;
+      moved = false;
+      const rect = this.getBoundingClientRect();
+      startX = e.clientX;
+      startY = e.clientY;
+      origL = rect.left;
+      origT = rect.top;
+      try {
+        this.setPointerCapture(e.pointerId);
+      } catch (_) {
+        /* ignore */
+      }
+      e.preventDefault();
+    });
+
+    $ball.on('pointermove', function (e) {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (Math.abs(dx) > 5 || Math.abs(dy) > 5) moved = true;
+      if (!moved) return;
+      const pos = clampMiniPos(origL + dx, origT + dy);
+      $(this).css({ left: `${pos.left}px`, top: `${pos.top}px`, right: 'auto', bottom: 'auto' });
+    });
+
+    $ball.on('pointerup pointercancel', function (e) {
+      if (!dragging) return;
+      dragging = false;
+      try {
+        this.releasePointerCapture?.(e.pointerId);
+      } catch (_) {
+        /* ignore */
+      }
+      if (!moved) {
+        restorePanel();
+        return;
+      }
+      const rect = this.getBoundingClientRect();
+      panelUiState.miniPos = clampMiniPos(rect.left, rect.top);
+    });
+  }
+  return $ball;
+}
+
+function showMiniBall() {
+  const $ = globalThis.jQuery;
+  if (!$) return;
+  const $ball = ensureMiniBall();
+  if (!$ball) return;
+  let left;
+  let top;
+  if (panelUiState.miniPos) {
+    ({ left, top } = clampMiniPos(panelUiState.miniPos.left, panelUiState.miniPos.top));
+  } else {
+    left = Math.max(0, window.innerWidth - 70);
+    top = Math.max(0, window.innerHeight - 120);
+  }
+  $ball.css({
+    display: 'flex',
+    left: `${left}px`,
+    top: `${top}px`,
+    right: 'auto',
+    bottom: 'auto',
+  });
+  syncMiniBallBusy();
+}
+
+function hideMiniBall() {
+  const $ = globalThis.jQuery;
+  if (!$) return;
+  $(`#${MINI_ID}`).css('display', 'none');
+}
+
+function minimizePanel() {
+  const $ = globalThis.jQuery;
+  if (!$) return;
+  ensurePanel();
+  panelUiState.minimized = true;
+  $(`#${OVERLAY_ID}`).css('display', 'none');
+  setEntryFloatVisible(false);
+  showMiniBall();
+  syncMiniBallBusy();
+  log.info('面板已最小化（后台继续运行）');
+}
+
+function restorePanel() {
+  panelUiState.minimized = false;
+  hideMiniBall();
+  openPanel();
+}
 
 function ensurePanel() {
   const $ = globalThis.jQuery;
@@ -1687,6 +1922,7 @@ function ensurePanel() {
             <span>${EXT_NAME}</span>
           </div>
           <div class="ns-panel__actions">
+            <button class="ns-btn ns-btn--icon" id="${EXT_ID}-minimize" title="最小化到圆球（后台继续）"><i class="fa-solid fa-minus"></i></button>
             <button class="ns-btn ns-btn--icon" id="${EXT_ID}-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>
           </div>
         </div>
@@ -1727,15 +1963,14 @@ function ensurePanel() {
           </div>
           <div class="ns-card" id="${EXT_ID}-idea"></div>
         </div>
-        <div class="ns-panel__footer"><span class="ns-muted">${EXT_NAME} v2.0</span></div>
+        <div class="ns-panel__footer"><span class="ns-muted">${EXT_NAME} v2.1</span></div>
       </div>
     </div>`;
   $('body').append(html);
   const $overlay = $(`#${OVERLAY_ID}`);
 
-  $overlay.on('click', (e) => {
-    if (e.target && e.target.id === OVERLAY_ID) closePanel();
-  });
+  // 点击遮罩不再关闭，避免误触回到主界面；仅点关闭按钮退出
+  $(`#${EXT_ID}-minimize`).on('click', minimizePanel);
   $(`#${EXT_ID}-close`).on('click', closePanel);
   $(`#${EXT_ID}-kw-save`).on('click', () => {
     const s = getSettings();
@@ -1751,11 +1986,8 @@ function ensurePanel() {
     saveSettings();
     refreshGlobalKeyword();
   });
-  $(document).on('keydown.novelstudio', (e) => {
-    if (e.key === 'Escape' && $overlay.is(':visible')) closePanel();
-  });
 
-  // 主模块折叠/展开（委托绑定到 overlay）
+  // 主模块折叠/展开（仅手动；状态写入 uiFoldState，重开面板时恢复）
   $overlay.on('click', '[data-act="module-fold"]', function () {
     const targetId = $(this).data('target');
     const $body = $(`#${targetId}`);
@@ -1763,6 +1995,9 @@ function ensurePanel() {
     const isHidden = $body.is(':hidden');
     $body.toggle();
     $icon.toggleClass('ns-module-icon--open', isHidden);
+    const modKey =
+      targetId === `${EXT_ID}-analyze-body` ? 'analyze' : targetId === `${EXT_ID}-novel-body` ? 'novel' : '';
+    if (modKey) uiFoldState.modules[modKey] = isHidden;
   });
 
   log.info('面板 DOM 已创建');
@@ -1808,27 +2043,27 @@ function fillKeywordForm() {
   $(`#${EXT_ID}-kw-hint`).text('');
 }
 
-/** 每次打开面板时，把两个主模块重置为折叠状态。 */
-/** 打开面板时折叠所有模块，并重置章级折叠状态（让重绘时按默认规则重新计算）。 */
-function collapseAllModules() {
+/** 按 uiFoldState 恢复主模块折叠（不改动任何子项状态）。 */
+function applyModuleFoldState() {
   const $ = globalThis.jQuery;
   if (!$) return;
-  $(`#${EXT_ID}-analyze-body, #${EXT_ID}-novel-body`).css('display', 'none');
-  $('[data-act="module-fold"] .ns-module-icon').removeClass('ns-module-icon--open');
-  // 重置写新小说所有章的折叠状态（清除 _folded，下次渲染按默认规则重算）
-  const proj = getActiveProject();
-  if (proj) for (const act of proj.acts || []) delete act._folded;
-  // 重置续写所有章的折叠状态
-  const cont = getContinuation();
-  if (cont) for (const act of cont.acts || []) delete act._folded;
-  // 重置 activeActIdx
-  novelState.activeActIdx = -1;
-  contState.activeActIdx = -1;
+  const pairs = [
+    [`${EXT_ID}-analyze-body`, 'analyze'],
+    [`${EXT_ID}-novel-body`, 'novel'],
+  ];
+  for (const [id, key] of pairs) {
+    const open = !!uiFoldState.modules[key];
+    $(`#${id}`).css('display', open ? '' : 'none');
+    $(`[data-act="module-fold"][data-target="${id}"] .ns-module-icon`).toggleClass('ns-module-icon--open', open);
+  }
 }
 
 function openPanel() {
   const $overlay = ensurePanel();
   if (!$overlay) return;
+  panelUiState.minimized = false;
+  hideMiniBall();
+  setEntryFloatVisible(false);
   refreshStatus();
   fillKeywordForm();
   // 节拖拽排序 — 必须先绑再 render，render 末尾会调 attach 绑定节
@@ -1850,7 +2085,7 @@ function openPanel() {
   renderNovelUI();      // renderNovelUI 末尾调 _novelDragAttach() 绑节
   bindIdeaEvents();
   renderIdeaUI();
-  collapseAllModules(); // 每次打开默认折叠所有模块
+  applyModuleFoldState(); // 恢复用户上次的主模块折叠，首次均为折叠
   $overlay.css('display', 'flex');
   log.info('面板已打开');
 }
@@ -1858,7 +2093,10 @@ function openPanel() {
 function closePanel() {
   const $ = globalThis.jQuery;
   if (!$) return;
+  panelUiState.minimized = false;
+  hideMiniBall();
   $(`#${OVERLAY_ID}`).css('display', 'none');
+  setEntryFloatVisible(true);
   log.info('面板已关闭');
 }
 
@@ -1952,12 +2190,12 @@ function renderAnalyzeResult() {
     <div class="ns-result">
       <div class="ns-result__meta ns-muted">分析结果 · ${esc(r.title)} · ${r.totalChars || 0} 字 · ${esc(when)}</div>
       <div class="ns-collapse">
-        <div class="ns-collapse__head" data-act="az-toggle"><i class="fa-solid fa-chevron-right ns-collapse__icon"></i><strong>角色档案</strong></div>
-        <div class="ns-collapse__body" style="display:none;">${esc(r.characters).replace(/\n/g, '<br>') || '（空）'}</div>
+        <div class="ns-collapse__head" data-act="az-toggle" data-fold-key="ct-chars"><i class="fa-solid fa-chevron-right ${foldIconClass('ct-chars')}"></i><strong>角色档案</strong></div>
+        <div class="ns-collapse__body"${foldBodyStyle('ct-chars')}>${esc(r.characters).replace(/\n/g, '<br>') || '（空）'}</div>
       </div>
       <div class="ns-collapse">
-        <div class="ns-collapse__head" data-act="az-toggle"><i class="fa-solid fa-chevron-right ns-collapse__icon"></i><strong>剧情梗概</strong></div>
-        <div class="ns-collapse__body" style="display:none;">${esc(r.plot).replace(/\n/g, '<br>') || '（空）'}</div>
+        <div class="ns-collapse__head" data-act="az-toggle" data-fold-key="ct-plot"><i class="fa-solid fa-chevron-right ${foldIconClass('ct-plot')}"></i><strong>剧情梗概</strong></div>
+        <div class="ns-collapse__body"${foldBodyStyle('ct-plot')}>${esc(r.plot).replace(/\n/g, '<br>') || '（空）'}</div>
       </div>
     </div>
     ${renderContinuationUI()}
@@ -2026,8 +2264,7 @@ function contChapterListHtml(cont) {
             ? `<div class="ns-muted">章总览：${esc(act.overview)}</div>`
             : '';
       const addSecBtn = mode === 'outline' ? `<div class="ns-row"><button class="ns-btn ns-btn--sm" data-act="ct-sec-add" data-a="${ai}"><i class="fa-solid fa-plus"></i> 添加节</button></div>` : '';
-      const isActiveAct = contState.activeActIdx === ai || (act.sections || []).some((s, si) => contState.activeFlatIdx === flatByAS[`${ai}_${si}`]);
-      const folded = isActiveAct ? false : typeof act._folded === 'boolean' ? act._folded : isActComplete(act);
+      const folded = isActFolded(act);
       return `
         <div class="ns-act ${folded ? 'ns-act--folded' : ''}" data-a="${ai}">
           <div class="ns-act__head">
@@ -2108,7 +2345,7 @@ function renderContinuationUI() {
     <p class="ns-muted">AI 将根据原文走向与人物剧情，自主逐章续写（每章一节），直到达到设定章数。</p>`;
 
   const summaryList = (cont.summaries || []).length
-    ? cont.summaries.map((s) => renderSummaryTable(s)).join('')
+    ? cont.summaries.map((s) => renderSummaryTable(s, 'ct-sum')).join('')
     : '';
 
   return `
@@ -2134,16 +2371,16 @@ function renderContinuationUI() {
       <div class="ns-field">${mode === 'outline' ? outlineActions : freeActions}</div>
       ${doneSec > 0 || summaryList ? `
       <div class="ns-collapse">
-        <div class="ns-collapse__head" data-act="summary-toggle">
-          <i class="fa-solid fa-chevron-right ns-collapse__icon"></i>
+        <div class="ns-collapse__head" data-act="summary-toggle" data-fold-key="ct-summaries">
+          <i class="fa-solid fa-chevron-right ${foldIconClass('ct-summaries')}"></i>
           <strong>整章表格总结（记忆）</strong>
         </div>
         <div class="ns-row" style="padding:4px 10px 0;">
           <button class="ns-btn ns-btn--sm" data-act="ct-resum" ${contState.generating ? 'disabled' : ''} title="对所有已完成章重新生成总结">全部重新总结</button>
           <button class="ns-btn ns-btn--sm ns-btn--danger" data-act="ct-clear-sum" title="清空所有章节总结">清空总结</button>
         </div>
-        <div class="ns-collapse__body ns-collapse__body--summary" style="display:none;">
-          ${grandSummaryHtml(cont)}
+        <div class="ns-collapse__body ns-collapse__body--summary"${foldBodyStyle('ct-summaries')}>
+          ${grandSummaryHtml(cont, 'ct-grand')}
           <div class="ns-summaries">${summaryList}</div>
         </div>
       </div>` : ''}
@@ -2249,6 +2486,8 @@ function bindAnalyzeEvents() {
       const isHidden = $body.is(':hidden');
       $body.toggle();
       $head.find('.ns-collapse__icon').toggleClass('ns-collapse__icon--open', isHidden);
+      const foldKey = $head.data('fold-key');
+      if (foldKey) setUiOpen(String(foldKey), isHidden);
       return;
     }
     if (act === 'az-reset') {
@@ -2631,6 +2870,7 @@ async function runIdea() {
     return;
   }
   ideaState.generating = true;
+  syncMiniBallBusy();
   renderIdeaUI();
   try {
     const { system, user } = buildIdeaPrompt(ctx, ideaState.tone);
@@ -2648,6 +2888,7 @@ async function runIdea() {
   } finally {
     ideaState.generating = false;
     ideaState.currentGenId = '';
+    syncMiniBallBusy();
     renderIdeaUI();
   }
 }
@@ -2781,34 +3022,108 @@ function bindIdeaEvents() {
 
 /* ---------------------------- 写小说 UI ---------------------------- */
 
-function renderEntityRows(entities) {
+const WORLD_DEF_TABS = [
+  { key: 'chars',  label: '人物', icon: 'fa-user-pen',    placeholder: '如：林川 - 主角，冷静果断，持有断罪之剑' },
+  { key: 'items',  label: '道具', icon: 'fa-wand-sparkles', placeholder: '如：断罪之剑 - 上古神器，能斩断因果' },
+  { key: 'places', label: '地理', icon: 'fa-map-location-dot', placeholder: '如：天平市 - 现代都市，血族三大家族的领地' },
+  { key: 'others', label: '其他', icon: 'fa-layer-group',  placeholder: '如：血族议事规则 - 每季度召开…' },
+];
+
+function renderEntityRows(entities, tabKey) {
   const list = Array.isArray(entities) && entities.length ? entities : [''];
+  const tab = WORLD_DEF_TABS.find((t) => t.key === tabKey) || WORLD_DEF_TABS[0];
   return list
     .map(
       (item, i) => `
       <div class="ns-outline-row">
-        <span class="ns-outline-no"><i class="fa-solid fa-user-pen"></i></span>
-        <textarea class="ns-entity-input" rows="1" placeholder="如：林川-主角，冷静果断，持有断罪之剑">${esc(item)}</textarea>
-        <button class="ns-btn ns-btn--icon ns-btn--sm" data-act="entity-del" data-idx="${i}" title="删除本行"><i class="fa-solid fa-trash"></i></button>
+        <span class="ns-outline-no"><i class="fa-solid ${tab.icon}"></i></span>
+        <textarea class="ns-entity-input" data-tab="${tabKey}" rows="1" placeholder="${tab.placeholder}">${esc(item)}</textarea>
+        <button class="ns-btn ns-btn--icon ns-btn--sm" data-act="entity-del" data-tab="${tabKey}" data-idx="${i}" title="删除本行"><i class="fa-solid fa-trash"></i></button>
       </div>`,
     )
     .join('');
 }
 
-function collectEntitiesFromDOM() {
+/** 渲染世界设定区（四板块标签页 + 预读取勾选）。 */
+function renderWorldDefsUI(proj) {
+  const wd = proj.worldDefs || {};
+  const activeTab = proj._worldDefTab || 'chars';
+  const isAll = activeTab === 'all';
+
+  // 标签：全部 + 四分类
+  const allTabHtml = `<button class="ns-tab ${isAll ? 'ns-tab--active' : ''}" data-act="wd-tab" data-tab="all"><i class="fa-solid fa-list"></i> 全部</button>`;
+  const catTabHtml = WORLD_DEF_TABS.map((t) =>
+    `<button class="ns-tab ${activeTab === t.key ? 'ns-tab--active' : ''}" data-act="wd-tab" data-tab="${t.key}"><i class="fa-solid ${t.icon}"></i> ${t.label}</button>`
+  ).join('');
+
+  let listHtml;
+  if (isAll) {
+    // 全部：汇总四板块，每类加小标题，只读
+    const sections = WORLD_DEF_TABS
+      .map(({ key, label, icon, placeholder }) => {
+        const list = (wd[key] || []).filter((e) => e && e.trim());
+        if (!list.length) return '';
+        const rows = list.map((item, i) => `
+          <div class="ns-outline-row">
+            <span class="ns-outline-no"><i class="fa-solid ${icon}"></i></span>
+            <span class="ns-wd-readonly">${esc(item)}</span>
+          </div>`).join('');
+        return `<div class="ns-wd-section"><div class="ns-wd-section__label">${label}</div>${rows}</div>`;
+      })
+      .filter(Boolean);
+    listHtml = sections.length
+      ? sections.join('')
+      : '<p class="ns-muted">暂无设定条目。切换到各分类标签进行添加。</p>';
+  } else {
+    listHtml = renderEntityRows(wd[activeTab] || [], activeTab);
+  }
+
+  return `
+    <div class="ns-wd-tabs">${allTabHtml}${catTabHtml}</div>
+    <div class="ns-entity-list" id="${EXT_ID}-wd-list">${listHtml}</div>
+    ${!isAll ? `<div class="ns-row"><button class="ns-btn ns-btn--sm" data-act="entity-add" data-tab="${activeTab}"><i class="fa-solid fa-plus"></i> 添加</button></div>` : ''}
+    <div class="ns-row" style="margin-top:6px;">
+      <label class="ns-switch" title="勾选后，每次生成都将世界设定与总结记忆额外注入 System 提示词（双重强化记忆）">
+        <input type="checkbox" id="${EXT_ID}-wd-preload" ${wd.preload ? 'checked' : ''} />
+        <span>预读取增强（设定+总结额外注入 System）</span>
+      </label>
+    </div>`;
+}
+
+/** 从 DOM 收集当前活动板块的条目并写入 worldDefs。
+ *  forceTab: 强制指定要保存到哪个板块（不传时读 proj._worldDefTab）。
+ */
+function collectWorldDefsFromDOM(proj, forceTab) {
   const $ = globalThis.jQuery;
-  if (!$) return [];
-  const vals = [];
-  $(`#${EXT_ID}-novel .ns-entity-input`).each(function () {
-    vals.push(String($(this).val() ?? ''));
-  });
-  return vals;
+  if (!$) return;
+  ensureWorldDefs(proj);
+  const wd = proj.worldDefs;
+  const activeTab = forceTab || proj._worldDefTab || 'chars';
+  // "全部"是只读视图，不收集
+  if (activeTab !== 'all') {
+    const vals = [];
+    $(`#${EXT_ID}-wd-list .ns-entity-input`).each(function () {
+      vals.push(String($(this).val() ?? ''));
+    });
+    wd[activeTab] = vals;
+  }
+  // 读取预读取勾选（始终同步）
+  const $cb = $(`#${EXT_ID}-wd-preload`);
+  if ($cb.length) wd.preload = $cb.is(':checked');
+}
+
+function collectEntitiesFromDOM() {
+  // 兼容旧调用 - 收集当前 worldDefs 活动板块
+  const proj = getActiveProject();
+  if (proj) collectWorldDefsFromDOM(proj);
 }
 
 function refreshEntityList(entities) {
   const $ = globalThis.jQuery;
   if (!$) return;
-  $(`#${EXT_ID}-novel .ns-entity-list`).html(renderEntityRows(entities));
+  const proj = getActiveProject();
+  if (!proj) return;
+  $(`#${EXT_ID}-wd-body`).html(renderWorldDefsUI(proj));
 }
 
 function setNovelHint(msg, busy) {
@@ -2862,9 +3177,8 @@ function novelChapterListHtml(proj) {
         })
         .join('');
 
-      // 折叠状态: 活动章强制展开; 否则沿用用户手动设置(act._folded), 未设置则整章完成默认折叠
-      const isActiveAct = novelState.activeActIdx === ai || (act.sections || []).some((s, si) => novelState.activeFlatIdx === flatByAS[`${ai}_${si}`]);
-      const folded = isActiveAct ? false : typeof act._folded === 'boolean' ? act._folded : isActComplete(act);
+      // 折叠状态: 仅沿用用户手动设置(act._folded)；未设置则默认折叠，生成过程不自动改
+      const folded = isActFolded(act);
       return `
         <div class="ns-act ${folded ? 'ns-act--folded' : ''}" data-a="${ai}">
           <div class="ns-act__head">
@@ -2904,7 +3218,7 @@ function renderNovelSummaries() {
   if (!proj) return;
   // 刷新章节总结列表
   const html = proj.summaries.length
-    ? proj.summaries.map((s) => renderSummaryTable(s)).join('')
+    ? proj.summaries.map((s) => renderSummaryTable(s, 'nv-sum')).join('')
     : '<p class="ns-muted">暂无总结。每写完一整章将自动生成该章表格总结。</p>';
   const $box = $(`#${EXT_ID}-novel .ns-summaries`);
   if ($box.length) $box.html(html);
@@ -2934,12 +3248,8 @@ function collectActsFromDOM(proj) {
 function exportProject(proj) {
   const lines = [`《${proj.title || '小说'}》`, ''];
   if (proj.background) lines.push('【背景设定】', proj.background, '');
-  const ents = (proj.entities || []).filter(Boolean);
-  if (ents.length) {
-    lines.push('【人物与道具设定】');
-    ents.forEach((e) => lines.push(`- ${e}`));
-    lines.push('');
-  }
+  const defsText = entitiesText(proj);
+  if (defsText) { lines.push(defsText, ''); }
   (proj.acts || []).forEach((act, ai) => {
     lines.push(`第 ${ai + 1} 章 ${act.title || ''}`.trim());
     if (act.overview) lines.push(`（章总览：${act.overview}）`);
@@ -2978,22 +3288,20 @@ function renderNovelUI() {
     const total = totalSectionCount(proj);
     const chapterList = novelChapterListHtml(proj);
     const summaryList = proj.summaries.length
-      ? proj.summaries.map((s) => renderSummaryTable(s)).join('')
+      ? proj.summaries.map((s) => renderSummaryTable(s, 'nv-sum')).join('')
       : `<p class="ns-muted">暂无总结。每写完一整章将自动生成该章表格总结。</p>`;
 
     body = `
       <div class="ns-collapse ns-collapse--edit">
-        <div class="ns-collapse__head" data-act="summary-toggle"><i class="fa-solid fa-chevron-right ns-collapse__icon"></i><strong>背景设定</strong></div>
-        <div class="ns-collapse__body ns-collapse__body--edit" style="display:none;">
+        <div class="ns-collapse__head" data-act="summary-toggle" data-fold-key="nv-bg"><i class="fa-solid fa-chevron-right ${foldIconClass('nv-bg')}"></i><strong>背景设定</strong></div>
+        <div class="ns-collapse__body ns-collapse__body--edit"${foldBodyStyle('nv-bg')}>
           <textarea id="${EXT_ID}-nv-bg" class="ns-textarea" rows="3" placeholder="世界观、设定、主要人物、写作要求等">${esc(proj.background)}</textarea>
         </div>
       </div>
       <div class="ns-collapse ns-collapse--edit">
-        <div class="ns-collapse__head" data-act="summary-toggle"><i class="fa-solid fa-chevron-right ns-collapse__icon"></i><strong>主要人物角色 / 道具设定</strong></div>
-        <div class="ns-collapse__body ns-collapse__body--edit" style="display:none;">
-          <p class="ns-muted">逐行添加，每节生成都会读取。</p>
-          <div class="ns-entity-list">${renderEntityRows(proj.entities)}</div>
-          <div class="ns-row"><button class="ns-btn ns-btn--sm" data-act="entity-add"><i class="fa-solid fa-plus"></i> 添加设定</button></div>
+        <div class="ns-collapse__head" data-act="summary-toggle" data-fold-key="nv-world"><i class="fa-solid fa-chevron-right ${foldIconClass('nv-world')}"></i><strong>世界设定（人物 / 道具 / 地理 / 其他）</strong></div>
+        <div class="ns-collapse__body ns-collapse__body--edit" id="${EXT_ID}-wd-body"${foldBodyStyle('nv-world')}>
+          ${renderWorldDefsUI(proj)}
         </div>
       </div>
       <div class="ns-field">
@@ -3016,16 +3324,16 @@ function renderNovelUI() {
         </div>
       </div>
       <div class="ns-collapse">
-        <div class="ns-collapse__head" data-act="summary-toggle">
-          <i class="fa-solid fa-chevron-right ns-collapse__icon"></i>
+        <div class="ns-collapse__head" data-act="summary-toggle" data-fold-key="nv-summaries">
+          <i class="fa-solid fa-chevron-right ${foldIconClass('nv-summaries')}"></i>
           <strong>整章表格总结（记忆）</strong>
         </div>
         <div class="ns-row" style="padding:4px 10px 0;">
           <button class="ns-btn ns-btn--sm" data-act="nv-resum" ${novelState.generating ? 'disabled' : ''} title="对所有已完成章重新生成总结">全部重新总结</button>
           <button class="ns-btn ns-btn--sm ns-btn--danger" data-act="nv-clear-sum" title="清空所有章节总结">清空总结</button>
         </div>
-        <div class="ns-collapse__body ns-collapse__body--summary" style="display:none;">
-          ${grandSummaryHtml(proj)}
+        <div class="ns-collapse__body ns-collapse__body--summary"${foldBodyStyle('nv-summaries')}>
+          ${grandSummaryHtml(proj, 'nv-grand')}
           <div class="ns-summaries">${summaryList}</div>
         </div>
       </div>
@@ -3045,17 +3353,17 @@ function renderNovelUI() {
   _novelDragAttach?.(); // 整块重绘后重新绑定拖拽
 }
 
-/** 渲染大总结折叠块(默认折叠)。 */
-function grandSummaryHtml(obj) {
+/** 渲染大总结折叠块（状态由 uiFoldState 决定，默认折叠）。 */
+function grandSummaryHtml(obj, foldKey = 'grand') {
   const text = buildGrandSummary(obj);
   const body = text ? esc(text).replace(/\n/g, '<br>') : '（暂无内容，生成节后自动汇总）';
   return `
     <div class="ns-collapse ns-grand-summary" style="margin-bottom:4px;">
-      <div class="ns-collapse__head" data-act="summary-toggle">
-        <i class="fa-solid fa-chevron-right ns-collapse__icon"></i>
+      <div class="ns-collapse__head" data-act="summary-toggle" data-fold-key="${foldKey}">
+        <i class="fa-solid fa-chevron-right ${foldIconClass(foldKey)}"></i>
         <strong><i class="fa-solid fa-layer-group" style="margin-right:4px;"></i>大总结（全书汇总 + 最新进度）</strong>
       </div>
-      <div class="ns-collapse__body ns-grand-summary__body" style="display:none;">${body}</div>
+      <div class="ns-collapse__body ns-grand-summary__body"${foldBodyStyle(foldKey)}>${body}</div>
     </div>`;
 }
 
@@ -3069,8 +3377,8 @@ function refreshGrandSummary(obj, containerSel) {
   $body.html(text ? esc(text).replace(/\n/g, '<br>') : '（暂无内容，生成节后自动汇总）');
 }
 
-/** 渲染一条整章总结为表格（可折叠，默认折叠）。 */
-function renderSummaryTable(s) {
+/** 渲染一条整章总结为表格（可折叠；状态由 uiFoldState 决定，默认折叠）。 */
+function renderSummaryTable(s, foldPrefix = 'sum') {
   const chars = Array.isArray(s.characters) ? s.characters : [];
   const plots = Array.isArray(s.plot) ? s.plot : [];
   const charRows = chars.length
@@ -3080,13 +3388,14 @@ function renderSummaryTable(s) {
     ? plots.map((p, i) => `<tr><td>${i + 1}</td><td>${esc(p)}</td></tr>`).join('')
     : `<tr><td colspan="2" class="ns-muted">（无）</td></tr>`;
   const title = s.actNo ? `第 ${s.actNo} 章总结 ${s.actTitle ? '· ' + esc(s.actTitle) : ''}` : `第 ${s.fromChapter}-${s.toChapter} 章总结`;
+  const foldKey = `${foldPrefix}-${s.actNo || `${s.fromChapter}-${s.toChapter}`}`;
   return `
     <div class="ns-summary ns-collapse">
-      <div class="ns-collapse__head" data-act="summary-toggle">
-        <i class="fa-solid fa-chevron-right ns-collapse__icon"></i>
+      <div class="ns-collapse__head" data-act="summary-toggle" data-fold-key="${foldKey}">
+        <i class="fa-solid fa-chevron-right ${foldIconClass(foldKey)}"></i>
         <strong>${title}</strong>
       </div>
-      <div class="ns-collapse__body" style="display:none;">
+      <div class="ns-collapse__body"${foldBodyStyle(foldKey)}>
         <table class="ns-table"><thead><tr><th>人物</th><th>状态/关系/目标</th></tr></thead><tbody>${charRows}</tbody></table>
         <table class="ns-table"><thead><tr><th>序</th><th>关键剧情</th></tr></thead><tbody>${plotRows}</tbody></table>
       </div>
@@ -3191,6 +3500,7 @@ async function runAutoAll(proj) {
 async function withGenerating(fn) {
   novelState.generating = true;
   novelState.cancelRequested = false;
+  syncMiniBallBusy();
   const $ = globalThis.jQuery;
   $?.(`#${EXT_ID}-novel [data-act="stop"]`).prop('disabled', false);
   try {
@@ -3203,8 +3513,9 @@ async function withGenerating(fn) {
     novelState.generating = false;
     novelState.cancelRequested = false;
     novelState.currentGenId = '';
-    novelState.activeActIdx = -1; // 生成结束后清除，避免后续重绘强制展开该章
+    novelState.activeActIdx = -1;
     $?.(`#${EXT_ID}-novel [data-act="stop"]`).prop('disabled', true);
+    syncMiniBallBusy();
   }
 }
 
@@ -3217,9 +3528,20 @@ function bindNovelEvents() {
 
   $root.on('change', `#${EXT_ID}-nv-select`, function () {
     getSettings().activeProjectId = $(this).val();
-    novelState.activeActIdx = -1; // 切换项目后不保留展开章
+    novelState.activeActIdx = -1;
     saveSettings();
     renderNovelUI();
+  });
+
+  // 预读取勾选即时保存
+  $root.on('change', `#${EXT_ID}-wd-preload`, function () {
+    const proj = getActiveProject();
+    if (proj) {
+      ensureWorldDefs(proj);
+      proj.worldDefs.preload = $(this).is(':checked');
+      touchProject(proj);
+      setNovelHint(proj.worldDefs.preload ? '预读取已开启，设定+总结将注入每次生成。' : '预读取已关闭。');
+    }
   });
 
   $root.on('click', '[data-act]', async function () {
@@ -3234,6 +3556,8 @@ function bindNovelEvents() {
         const isHidden = $body.is(':hidden');
         $body.toggle();
         $head.find('.ns-collapse__icon').toggleClass('ns-collapse__icon--open', isHidden);
+        const foldKey = $head.data('fold-key');
+        if (foldKey) setUiOpen(String(foldKey), isHidden);
         break;
       }
       case 'act-fold': {
@@ -3346,28 +3670,45 @@ function bindNovelEvents() {
           }
         }
         break;
+      case 'wd-tab':
+        if (proj) {
+          collectWorldDefsFromDOM(proj); // 先保存当前板块
+          proj._worldDefTab = $(this).data('tab');
+          ensureWorldDefs(proj);
+          // 用精准 id 重绘整个设定区内容
+          $(`#${EXT_ID}-wd-body`).html(renderWorldDefsUI(proj));
+        }
+        break;
       case 'entity-add':
         if (proj) {
-          const cur = collectEntitiesFromDOM();
-          cur.push('');
-          refreshEntityList(cur);
-          $(`#${EXT_ID}-novel .ns-entity-input`).last().focus();
+          const tab = $(this).data('tab') || proj._worldDefTab || 'chars';
+          proj._worldDefTab = tab; // 同步内存状态
+          collectWorldDefsFromDOM(proj, tab); // 先保存当前输入（传 tab 确保存到正确板块）
+          ensureWorldDefs(proj);
+          if (!Array.isArray(proj.worldDefs[tab])) proj.worldDefs[tab] = [];
+          proj.worldDefs[tab].push('');
+          $(`#${EXT_ID}-wd-body`).html(renderWorldDefsUI(proj)); // 整体重绘保持一致
+          $(`#${EXT_ID}-wd-list .ns-entity-input`).last().focus();
         }
         break;
       case 'entity-del':
-        if (proj && Number.isInteger(idx)) {
-          const cur = collectEntitiesFromDOM();
-          cur.splice(idx, 1);
-          refreshEntityList(cur);
+        if (proj) {
+          const tab = $(this).data('tab') || proj._worldDefTab || 'chars';
+          proj._worldDefTab = tab; // 同步内存状态
+          collectWorldDefsFromDOM(proj, tab);
+          ensureWorldDefs(proj);
+          const di = Number($(this).data('idx'));
+          if (Number.isInteger(di) && proj.worldDefs[tab]) proj.worldDefs[tab].splice(di, 1);
+          $(`#${EXT_ID}-wd-body`).html(renderWorldDefsUI(proj));
         }
         break;
       case 'save-meta':
         if (proj) {
           proj.background = String($(`#${EXT_ID}-nv-bg`).val() ?? '');
-          proj.entities = collectEntitiesFromDOM().map((e) => e.trim()).filter(Boolean);
+          collectWorldDefsFromDOM(proj); // 保存当前板块 + preload 状态
           collectActsFromDOM(proj);
           touchProject(proj);
-          setNovelHint('已保存背景、人物设定与章-节大纲。');
+          setNovelHint('已保存背景、世界设定与章-节大纲。');
           renderNovelUI();
         }
         break;
@@ -3481,7 +3822,7 @@ function injectWandMenuButton() {
 function injectFloatingButton() {
   const $ = globalThis.jQuery;
   if (!$) return false;
-  const FLOAT_ID = `${EXT_ID}-float-button`;
+  const FLOAT_ID = ENTRY_FLOAT_ID;
   if ($(`#${FLOAT_ID}`).length) return true;
   const $btn = $(`<div id="${FLOAT_ID}" class="ns-float-btn" title="开始创意 (${EXT_NAME})"><i class="fa-solid fa-feather-pointed"></i></div>`);
   $btn.on('click', () => {
@@ -3566,4 +3907,4 @@ async function boot() {
 
 boot().catch((e) => log.error('初始化异常:', e));
 
-export { openPanel, closePanel };
+export { openPanel, closePanel, minimizePanel, restorePanel };

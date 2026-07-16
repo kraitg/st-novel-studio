@@ -27,6 +27,61 @@
   background: var(--SmartThemeQuoteColor, #6a8dff);
 }
 
+/* 最小化圆球（可拖动，后台继续工作） */
+.ns-mini-ball {
+  position: fixed;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  z-index: 10002;
+  touch-action: none;
+  user-select: none;
+  background: linear-gradient(145deg, #ffb347 0%, #ff7a18 45%, #e85d04 100%);
+  color: #fff;
+  border: 2px solid rgba(255, 236, 200, 0.85);
+  box-shadow:
+    0 4px 16px rgba(232, 93, 4, 0.55),
+    0 0 0 3px rgba(255, 122, 24, 0.25);
+  font-size: 1.15rem;
+  transition: box-shadow 0.2s ease, transform 0.15s ease, filter 0.2s ease;
+}
+.ns-mini-ball:active {
+  cursor: grabbing;
+}
+.ns-mini-ball:hover {
+  filter: brightness(1.08);
+  box-shadow:
+    0 6px 22px rgba(232, 93, 4, 0.7),
+    0 0 0 4px rgba(255, 122, 24, 0.35);
+  transform: scale(1.06);
+}
+.ns-mini-ball__ring {
+  position: absolute;
+  inset: -5px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  pointer-events: none;
+}
+.ns-mini-ball--busy {
+  box-shadow:
+    0 4px 18px rgba(232, 93, 4, 0.65),
+    0 0 0 3px rgba(255, 180, 70, 0.45);
+}
+.ns-mini-ball--busy .ns-mini-ball__ring {
+  border-top-color: #fff4e0;
+  border-right-color: rgba(255, 200, 120, 0.55);
+  animation: ns-mini-spin 0.9s linear infinite;
+}
+@keyframes ns-mini-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* 遮罩层 */
 .ns-overlay {
   position: fixed;
@@ -277,6 +332,32 @@
   border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
 }
 
+/* 世界设定板块标签 */
+.ns-wd-tabs {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+/* 全部视图：分类标题 */
+.ns-wd-section {
+  margin-bottom: 8px;
+}
+.ns-wd-section__label {
+  font-size: 0.78rem;
+  opacity: 0.6;
+  margin-bottom: 3px;
+  padding-left: 2px;
+}
+/* 只读条目文本 */
+.ns-wd-readonly {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 0.88rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 /* 续写: 标签页 */
 .ns-tabs {
   display: inline-flex;
