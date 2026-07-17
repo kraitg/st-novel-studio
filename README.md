@@ -1,4 +1,4 @@
-# Novel Studio 小说工坊 (v2.0)
+# Novel Studio 小说工坊 (v2.2)
 
 一个 **SillyTavern / TauriTavern 第三方扩展** 的调试骨架。当前版本只做一件事：
 

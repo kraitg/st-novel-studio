@@ -80,9 +80,8 @@ function getTavernHelper() {
 /* ------------------------------------------------------------------ */
 
 /**
- * 读取当前激活的预设 System Prompt 文字内容。
- * 来源: context.powerUserSettings.sysprompt (CC/TC 通用)。
- * 未启用或读取失败时返回空串。
+ * 读取当前激活的 System Prompt 文字（Instruct/sysprompt）。
+ * 仅由本扩展在 generateRaw 的 system 里放入一次；工坊生成期间会清空扩展注入，避免与酒馆管道叠份。
  */
 function readSysPrompt() {
   const ctx = getST();
@@ -98,12 +97,30 @@ function readSysPrompt() {
 
 /**
  * 读取当前全局提示词（globalKeyword）文字内容。
- * 已通过 setExtensionPrompt 走 ST 机制注入，但也显式放入 system 确保双重生效。
+ * 普通聊天走 setExtensionPrompt；小说工坊 generateRaw 只在 ordered_prompts 里放一次，避免重复。
  */
 function readGlobalKeyword() {
   const s = getSettings();
   if (!s.keywordEnabled) return '';
   return (s.globalKeyword || '').trim();
+}
+
+/** >0 时跳过 GENERATION_STARTED 刷新注入，避免工坊 generateRaw 与显式 prompt 叠两份。 */
+let suppressKeywordRefresh = 0;
+
+/** 临时清空扩展注入，执行 fn 后恢复（供 generateRaw 独占提示词）。 */
+async function withClearedKeywordInject(fn) {
+  suppressKeywordRefresh += 1;
+  const ctx = getST();
+  try {
+    if (ctx && typeof ctx.setExtensionPrompt === 'function') {
+      ctx.setExtensionPrompt(INJECT_KEY, '', PROMPT_TYPE.IN_CHAT, 4, false, PROMPT_ROLE.SYSTEM);
+    }
+    return await fn();
+  } finally {
+    suppressKeywordRefresh = Math.max(0, suppressKeywordRefresh - 1);
+    if (suppressKeywordRefresh === 0) refreshGlobalKeyword();
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -197,6 +214,7 @@ function saveSettings() {
 }
 
 function refreshGlobalKeyword() {
+  if (suppressKeywordRefresh > 0) return;
   const ctx = getST();
   if (!ctx || typeof ctx.setExtensionPrompt !== 'function') {
     log.warn('setExtensionPrompt 不可用, 无法注入全局关键字');
@@ -378,10 +396,30 @@ function ensureWorldDefs(proj) {
   }
 }
 
+/** 清理历史脏数据：done=true 但正文为空/过短的节改为未完成。 */
+function sanitizeEmptyDoneSections(obj) {
+  if (!obj?.acts) return;
+  let changed = false;
+  for (const act of obj.acts) {
+    for (const sec of act.sections || []) {
+      if (sec.done && !hasValidSectionContent(sec)) {
+        sec.done = false;
+        sec.content = '';
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
 function getActiveProject() {
   const s = getSettings();
   const proj = getProjects().find((p) => p.id === s.activeProjectId) || null;
-  if (proj) { ensureActs(proj); ensureWorldDefs(proj); }
+  if (proj) {
+    ensureActs(proj);
+    ensureWorldDefs(proj);
+    if (sanitizeEmptyDoneSections(proj)) touchProject(proj);
+  }
   return proj;
 }
 
@@ -395,6 +433,7 @@ function makeProject(title, source = 'manual') {
     worldDefs: { chars: [], items: [], places: [], others: [], preload: false }, // 世界设定分类
     acts: [], // 章-节层次结构 Act[]
     summaries: [], // 每大章一条表格总结
+    liveProgress: null, // 最新进度动态总结 {actNo,secNo,characters,charChains,plot,updatedAt}
     analysis: null,
     source,
     createdAt: now,
@@ -459,17 +498,31 @@ function flatSections(obj) {
 }
 
 /** 已完成节数。 */
+/** 已完成节数(仅计有效正文，空回不算完成)。 */
 function doneSectionCount(obj) {
-  return flatSections(obj).filter((f) => f.sec.done).length;
+  return flatSections(obj).filter((f) => hasValidSectionContent(f.sec)).length;
 }
 /** 全部节数。 */
 function totalSectionCount(obj) {
   return flatSections(obj).length;
 }
-/** 判断某大章是否所有节都已完成(且至少有一个节)。 */
+/** 判断某大章是否所有节都已完成(且至少有一个节)。空回节视为未完成。 */
 function isActComplete(act) {
   const secs = act.sections || [];
-  return secs.length > 0 && secs.every((s) => s.done);
+  return secs.length > 0 && secs.every((s) => hasValidSectionContent(s));
+}
+/** 章内是否已有可总结的正文(允许章未写完时强制总结)。 */
+function actHasGeneratedContent(act) {
+  return (act?.sections || []).some((s) => hasValidSectionContent(s));
+}
+/** 取全书最后一节已生成正文的位置。 */
+function findLastDoneSection(obj) {
+  const flat = flatSections(obj);
+  for (let i = flat.length - 1; i >= 0; i--) {
+    const f = flat[i];
+    if (hasValidSectionContent(f.sec)) return f;
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -676,49 +729,79 @@ function isRetryableError(err) {
     msg.includes('fetch') ||
     msg.includes('econnreset') ||
     msg.includes('socket') ||
-    msg.includes('abort')
+    msg.includes('abort') ||
+    msg.includes('空回复')
   );
 }
 
+/** 正文最短有效长度(过短视为空回，需重试)。 */
+const MIN_SECTION_CHARS = 30;
+
 /** 判断生成结果是否为"空回复"(需要重试)。 */
-function isEmptyReply(text) {
+function isEmptyReply(text, minLen = 2) {
   const t = String(text ?? '').trim();
-  return t.length < 2; // 空或过短视为空回复
+  return t.length < minLen;
 }
 
-/** 单次生成(不含重试)。带超时保护。 */
+/** 节正文是否有效(非空且达最短字数)。 */
+function hasValidSectionContent(sec) {
+  return !!sec && String(sec.content || '').trim().length >= MIN_SECTION_CHARS;
+}
+
+/** 单次生成(不含重试)。带超时保护；超时只停本 gid，避免 stopAll 引发未处理 abort。 */
 async function _genOnce({ system, user }, gid) {
   const timeoutMs = getSettings().genTimeoutMs || 180000;
   const th = getTavernHelper();
 
-  const doGen = async () => {
-    if (th && typeof th.generateRaw === 'function') {
-      const result = await th.generateRaw({
-        ordered_prompts: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-        should_stream: false,
-        should_silence: true,
-        generation_id: gid,
-      });
-      return typeof result === 'string' ? result : (result?.content ?? String(result ?? ''));
-    }
-    const ctx = getST();
-    if (ctx && typeof ctx.generateRaw === 'function') {
-      const result = await ctx.generateRaw({ prompt: user, systemPrompt: system, prefill: '' });
-      return typeof result === 'string' ? result : String(result ?? '');
-    }
-    throw new Error('无可用生成接口(TavernHelper.generateRaw / 原生 generateRaw 均不可用)');
-  };
+  const doGen = () =>
+    withClearedKeywordInject(async () => {
+      if (th && typeof th.generateRaw === 'function') {
+        // 只用 RolePrompt：不带预设占位符，避免与导入预设/扩展注入叠两份
+        const result = await th.generateRaw({
+          ordered_prompts: [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+          ],
+          should_stream: false,
+          should_silence: true,
+          generation_id: gid,
+          overrides: {
+            chat_history: { with_depth_entries: false, prompts: [] },
+            world_info_before: '',
+            world_info_after: '',
+            char_description: '',
+            char_personality: '',
+            scenario: '',
+            persona_description: '',
+            dialogue_examples: '',
+          },
+        });
+        return typeof result === 'string' ? result : (result?.content ?? String(result ?? ''));
+      }
+      const ctx = getST();
+      if (ctx && typeof ctx.generateRaw === 'function') {
+        const result = await ctx.generateRaw({ prompt: user, systemPrompt: system, prefill: '' });
+        return typeof result === 'string' ? result : String(result ?? '');
+      }
+      throw new Error('无可用生成接口(TavernHelper.generateRaw / 原生 generateRaw 均不可用)');
+    });
 
-  // 超时竞速: 超时视为可重试错误
   let timer;
+  const genP = doGen();
+  // 竞速失败后仍要吞掉后续 abort，避免 Unhandled rejection
+  genP.catch(() => {});
   const timeoutP = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`生成超时(${timeoutMs}ms) timeout`)), timeoutMs);
+    timer = setTimeout(() => {
+      try {
+        if (th?.stopGenerationById) th.stopGenerationById(gid);
+      } catch (e) {
+        log.debug('超时停止生成忽略:', e?.message || e);
+      }
+      reject(new Error(`生成超时(${timeoutMs}ms) timeout`));
+    }, timeoutMs);
   });
   try {
-    return await Promise.race([doGen(), timeoutP]);
+    return await Promise.race([genP, timeoutP]);
   } finally {
     clearTimeout(timer);
   }
@@ -726,26 +809,28 @@ async function _genOnce({ system, user }, gid) {
 
 /**
  * 生成(含重试)。504/502/503/超时/网络错误/空回复 → 指数退避重试。
+ * 每次重试使用新的 generation_id，避免酒馆助手缓存同 id 的空结果。
  * @param {()=>boolean} shouldCancel 可选，返回 true 时中止重试。
+ * @param {{ minLen?: number }} opts 空回复判定最短长度。
  */
-async function novelGenerateWithId({ system, user }, gid, shouldCancel) {
+async function novelGenerateWithId({ system, user }, gid, shouldCancel, opts = {}) {
   const s = getSettings();
   const maxRetries = Math.max(0, s.genMaxRetries ?? 3);
   const baseMs = s.genRetryBaseMs || 1500;
+  const minLen = opts.minLen ?? 2;
   let lastErr = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (shouldCancel?.()) throw new Error('已中止');
+    // 每次尝试使用独立 generation_id，防止空回被接口按 id 复用
+    const attemptGid = attempt === 0 ? gid : `${gid}_r${attempt}_${Date.now()}`;
     try {
-      const text = await _genOnce({ system, user }, gid);
-      if (isEmptyReply(text)) {
-        // 空回复：视为可重试
-        if (attempt < maxRetries) {
-          lastErr = new Error('空回复');
-          log.warn(`生成得到空回复, 第 ${attempt + 1} 次重试…`);
-        } else {
-          log.warn('生成多次空回复, 返回空串');
-          return '';
+      const text = await _genOnce({ system, user }, attemptGid);
+      if (isEmptyReply(text, minLen)) {
+        lastErr = new Error('空回复');
+        log.warn(`生成得到空回复(len=${String(text ?? '').trim().length}), 第 ${attempt + 1} 次…`);
+        if (attempt >= maxRetries) {
+          throw new Error(`多次空回复(已重试 ${maxRetries + 1} 次)`);
         }
       } else {
         if (attempt > 0) log.info(`生成在第 ${attempt + 1} 次尝试成功`);
@@ -756,14 +841,13 @@ async function novelGenerateWithId({ system, user }, gid, shouldCancel) {
       const retryable = isRetryableError(e);
       log.warn(`生成失败(第 ${attempt + 1} 次): ${e.message}${retryable ? ' [可重试]' : ' [不可重试]'}`);
       if (!retryable || attempt >= maxRetries) {
-        throw e; // 不可重试或已用尽次数
+        throw e;
       }
     }
     // 指数退避 + 抖动
     if (attempt < maxRetries) {
       const delay = baseMs * Math.pow(2, attempt) + Math.floor(Math.random() * 500);
       log.info(`${delay}ms 后重试(${attempt + 2}/${maxRetries + 1})…`);
-      // 分段等待以便及时响应中止
       const step = 200;
       for (let waited = 0; waited < delay; waited += step) {
         if (shouldCancel?.()) throw new Error('已中止');
@@ -774,10 +858,34 @@ async function novelGenerateWithId({ system, user }, gid, shouldCancel) {
   throw lastErr || new Error('生成失败');
 }
 
-async function novelGenerate({ system, user }) {
-  const gid = `novel_${Date.now()}`;
+async function novelGenerate({ system, user }, opts = {}) {
+  const gid = `novel_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   novelState.currentGenId = gid;
-  return novelGenerateWithId({ system, user }, gid, () => novelState.cancelRequested);
+  return novelGenerateWithId({ system, user }, gid, () => novelState.cancelRequested, opts);
+}
+
+/**
+ * 清理生成通道状态。
+ * @param {'novel'|'cont'} kind
+ * @param {{ hard?: boolean }} opts hard=true 时 stopAll（仅用户点重新生成）；空回重试必须 soft，否则会 abort 下一次请求。
+ */
+function resetGenerationChannel(kind = 'novel', { hard = false } = {}) {
+  if (hard) {
+    const th = getTavernHelper();
+    try {
+      if (th?.stopAllGeneration) th.stopAllGeneration();
+      else getST()?.stopGeneration?.();
+    } catch (e) {
+      log.debug('清理生成通道时忽略:', e?.message || e);
+    }
+  }
+  if (kind === 'cont') {
+    contState.cancelRequested = false;
+    contState.currentGenId = '';
+  } else {
+    novelState.cancelRequested = false;
+    novelState.currentGenId = '';
+  }
 }
 
 function stopNovelGeneration() {
@@ -814,7 +922,7 @@ function latestSummaryText(obj) {
   return `【已发生剧情总结(第${s.actNo}章)】\n${summaryToTable(s)}`;
 }
 
-/** 取最新已生成节正文末尾若干字(反映当前最新进度)。 */
+/** 取最新已生成节正文末尾若干字(反映当前最新进度，无动态总结时兜底)。 */
 function latestSectionExcerpt(obj, chars = 800) {
   const flat = flatSections(obj);
   for (let i = flat.length - 1; i >= 0; i--) {
@@ -827,9 +935,316 @@ function latestSectionExcerpt(obj, chars = 800) {
   return '';
 }
 
+/** 人物链格式化为「A → B → C」。 */
+function formatCharChain(chain) {
+  const steps = Array.isArray(chain) ? chain.map((x) => String(x || '').trim()).filter(Boolean) : [];
+  return steps.join(' → ');
+}
+
+/** 规范化人名用于合并。 */
+function normCharName(name) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '');
+}
+
+/** 规范化状态文本，便于相似度比较。 */
+function normalizeChainStep(s) {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[，。、；：！？,.!?;:\s　""''「」『』（）()【】\[\]…—\-·《》]/g, '')
+    .replace(/(?:的|了|着|过|地|得|与|和|及|被|在|后|时|中|而|并|又|也|很|非常|极度|感到|深感)/g, '');
+}
+
+/** 字符 bigram 集合。 */
+function charBigrams(s) {
+  const t = normalizeChainStep(s);
+  if (!t) return new Set();
+  if (t.length === 1) return new Set([t]);
+  const set = new Set();
+  for (let i = 0; i < t.length - 1; i++) set.add(t.slice(i, i + 2));
+  return set;
+}
+
+/** 两段状态描述的相似度 0~1（Jaccard + 包含关系）。 */
+function chainStepSimilarity(a, b) {
+  const na = normalizeChainStep(a);
+  const nb = normalizeChainStep(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  const [shorter, longer] = na.length <= nb.length ? [na, nb] : [nb, na];
+  // 较短段被较长段包含，且有足够信息量 → 视为同义复述
+  if (shorter.length >= 6 && longer.includes(shorter)) {
+    return 0.92;
+  }
+  const A = charBigrams(a);
+  const B = charBigrams(b);
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const x of A) if (B.has(x)) inter++;
+  const union = A.size + B.size - inter;
+  const jaccard = union ? inter / union : 0;
+  // 关键关键词重叠：取较长串的覆盖率
+  const cover = Math.max(inter / A.size, inter / B.size);
+  return Math.max(jaccard, cover * 0.85);
+}
+
+/** 是否为同义/近义复述（不应再追加为新节点）。 */
+function isSimilarChainStep(a, b, threshold = 0.4) {
+  return chainStepSimilarity(a, b) >= threshold;
+}
+
 /**
- * 大总结: 汇总全部已归档章节表格总结 + 动态附上最新生成节节选。
- * 作为长期记忆注入生成; 也用于创意灵感。纯拼接, 不额外调用 AI。
+ * 压缩人物链：去掉同义反复；
+ * - 与已有任一节点相似 → 不新增；
+ * - 与末节点相似 → 用信息量更大或更新的表述替换末节点。
+ */
+function dedupeChainSteps(chain) {
+  const out = [];
+  for (const raw of chain || []) {
+    const s = String(raw || '').trim();
+    if (!s) continue;
+    let simIdx = -1;
+    let bestSim = 0;
+    for (let i = 0; i < out.length; i++) {
+      const sim = chainStepSimilarity(out[i], s);
+      if (sim > bestSim) {
+        bestSim = sim;
+        simIdx = i;
+      }
+    }
+    if (bestSim >= 0.4 && simIdx >= 0) {
+      // 与末节点近义：可微调措辞；与更早节点近义：直接丢弃（防止循环复述）
+      if (simIdx === out.length - 1) {
+        if (s.length > out[simIdx].length) out[simIdx] = s;
+      }
+      continue;
+    }
+    out.push(s);
+  }
+  return out;
+}
+
+/** 仅当新状态与链中已有节点均不近义时才追加。 */
+function appendChainStep(chain, step) {
+  const s = String(step || '').trim();
+  if (!s || !Array.isArray(chain)) return false;
+  for (let i = 0; i < chain.length; i++) {
+    if (isSimilarChainStep(chain[i], s)) {
+      if (i === chain.length - 1 && s.length > chain[i].length) chain[i] = s;
+      return false;
+    }
+  }
+  chain.push(s);
+  return true;
+}
+
+/**
+ * 合并人物链：拼接后做近义去重，避免「同处境不同措辞」反复出现。
+ * prev / next: [{name, chain:string[]}]
+ */
+function mergeCharChains(prev, next) {
+  const map = new Map();
+  const ingest = (list) => {
+    for (const c of list || []) {
+      const name = String(c?.name || '').trim();
+      const key = normCharName(name);
+      if (!key && !(c?.chain || []).length) continue;
+      const mapKey = key || `anon_${map.size}`;
+      if (!map.has(mapKey)) map.set(mapKey, { name: name || mapKey, chain: [] });
+      const entry = map.get(mapKey);
+      if (name) entry.name = name;
+      for (const step of c?.chain || []) appendChainStep(entry.chain, step);
+    }
+  };
+  ingest(prev);
+  ingest(next);
+  return [...map.values()]
+    .map((c) => ({ name: c.name, chain: dedupeChainSteps(c.chain) }))
+    .filter((c) => c.name || c.chain.length);
+}
+
+/** 仅从各章总结按时间拼人物链（确定性，不依赖 AI）。 */
+function charChainsFromSummaries(obj) {
+  const map = new Map();
+  for (const s of obj?.summaries || []) {
+    for (const c of s.characters || []) {
+      const name = String(c.name || '').trim();
+      if (!name) continue;
+      const key = normCharName(name);
+      if (!map.has(key)) map.set(key, { name, chain: [] });
+      appendChainStep(map.get(key).chain, c.detail);
+    }
+  }
+  return [...map.values()].map((c) => ({ name: c.name, chain: dedupeChainSteps(c.chain) }));
+}
+
+/**
+ * 展示用人物链：章总结时间线 ∪ liveProgress 细链，合并并近义去重。
+ * 顺带清理 liveProgress 内已堆积的近义重复节点。
+ */
+function collectCharChains(obj) {
+  if (Array.isArray(obj?.liveProgress?.charChains)) {
+    obj.liveProgress.charChains = obj.liveProgress.charChains.map((c) => ({
+      name: c.name,
+      chain: dedupeChainSteps(c.chain || []),
+    }));
+  }
+  return mergeCharChains(charChainsFromSummaries(obj), obj?.liveProgress?.charChains || []);
+}
+
+/** 人物链纯文本(注入 prompt / 大总结末尾)。 */
+function charChainsToText(chains) {
+  const list = Array.isArray(chains) ? chains : [];
+  const lines = ['【人物链(状态演变·从头至最新)】', '| 人物 | 变化轨迹 |', '| --- | --- |'];
+  if (!list.length) {
+    lines.push('| (无) | |');
+    return lines.join('\n');
+  }
+  for (const c of list) {
+    lines.push(`| ${c.name || ''} | ${formatCharChain(c.chain) || '(无)'} |`);
+  }
+  return lines.join('\n');
+}
+
+/** 人物链 HTML：固定放在大总结最下方。 */
+function charChainsToHtml(chains) {
+  const list = Array.isArray(chains) ? chains : [];
+  const rows = list.length
+    ? list
+        .map((c) => {
+          const steps = Array.isArray(c.chain) ? c.chain.map((x) => String(x || '').trim()).filter(Boolean) : [];
+          const traj = steps.length
+            ? steps
+                .map((s, i) => `${i ? '<span class="ns-chain-arrow">→</span>' : ''}<span class="ns-chain-step">${esc(s)}</span>`)
+                .join('')
+            : '<span class="ns-muted">（无）</span>';
+          return `<tr><td>${esc(c.name || '')}</td><td class="ns-char-chain">${traj}</td></tr>`;
+        })
+        .join('')
+    : `<tr><td colspan="2" class="ns-muted">（暂无人物链。生成节或点「全部重新总结」后出现）</td></tr>`;
+  return `
+    <div class="ns-char-chains-block">
+      <div class="ns-live-progress__title"><strong>人物链</strong><span class="ns-muted">（从头至最新节 · 状态 A → B → C）</span></div>
+      <table class="ns-table"><thead><tr><th>人物</th><th>变化轨迹</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>`;
+}
+
+/** 全部章节总结中的人物表(按章序，供人物链重建)。 */
+function allSummariesCharHistoryText(obj) {
+  const sums = Array.isArray(obj?.summaries) ? obj.summaries : [];
+  if (!sums.length) return '';
+  return sums
+    .map((s) => {
+      const chars = Array.isArray(s.characters) ? s.characters : [];
+      const lines = chars.length
+        ? chars.map((c) => `- ${c.name || ''}：${(c.detail || '').replace(/\n/g, ' ')}`).join('\n')
+        : '- (无)';
+      return `● 第${s.actNo}章${s.actTitle ? '「' + s.actTitle + '」' : ''}${s.partial ? '(未完成)' : ''}人物\n${lines}`;
+    })
+    .join('\n\n');
+}
+
+/**
+ * 收集截至 (actIdx,secIdx) 的全部已生成节正文素材(按时间序)。
+ * 用于人物链必须覆盖「从头到最新节」；超长时保头保尾、压缩中间。
+ */
+function collectSectionsCorpus(obj, actIdx, secIdx, { maxPerSec = 1800, maxTotal = 28000 } = {}) {
+  const flat = flatSections(obj);
+  const items = [];
+  for (const f of flat) {
+    if (f.actIdx > actIdx || (f.actIdx === actIdx && f.secIdx > secIdx)) break;
+    if (!f.sec.done || !String(f.sec.content || '').trim()) continue;
+    let body = String(f.sec.content).trim();
+    if (body.length > maxPerSec) {
+      const head = Math.floor(maxPerSec * 0.45);
+      const tail = maxPerSec - head - 20;
+      body = `${body.slice(0, head)}\n…(中略)…\n${body.slice(-tail)}`;
+    }
+    items.push({
+      label: `第${f.actIdx + 1}章 第${f.secIdx + 1}节`,
+      body,
+      block: `【第${f.actIdx + 1}章 第${f.secIdx + 1}节】\n${body}`,
+    });
+  }
+  if (!items.length) return '';
+  const full = items.map((x) => x.block).join('\n\n');
+  if (full.length <= maxTotal) return full;
+
+  // 超预算：开头若干节 + 结尾若干节保留较完整，中间节短摘
+  const keepHead = Math.min(4, items.length);
+  const keepTail = Math.min(5, Math.max(0, items.length - keepHead));
+  const parts = [];
+  for (let i = 0; i < items.length; i++) {
+    const isHead = i < keepHead;
+    const isTail = i >= items.length - keepTail;
+    if (isHead || isTail) {
+      parts.push(items[i].block);
+    } else {
+      const b = items[i].body;
+      parts.push(`【${items[i].label}】(中间节摘录)\n${b.slice(0, 320)}${b.length > 320 ? '…' : ''}`);
+    }
+  }
+  let out = parts.join('\n\n');
+  if (out.length > maxTotal) {
+    out = [...items.slice(0, keepHead), ...items.slice(items.length - keepTail)].map((x) => x.block).join('\n\n');
+  }
+  return out;
+}
+
+/** 把 liveProgress 渲染成文本(注入 prompt / 纯文本展示，不含末尾人物链)。 */
+function liveProgressToText(lp) {
+  if (!lp) return '';
+  const lines = [];
+  const loc = `第${lp.actNo || '?'}章 第${lp.secNo || '?'}节`;
+  lines.push(`【当前最新进度 · 动态总结(${loc})】`);
+  lines.push('人物档案表:');
+  lines.push('| 人物 | 当前状态/关系/目标 |');
+  lines.push('| --- | --- |');
+  const chars = Array.isArray(lp.characters) ? lp.characters : [];
+  if (chars.length) {
+    for (const c of chars) lines.push(`| ${c.name || ''} | ${(c.detail || '').replace(/\n/g, ' ')} |`);
+  } else {
+    lines.push('| (无) | |');
+  }
+  const plots = Array.isArray(lp.plot) ? lp.plot : [];
+  if (plots.length) {
+    lines.push('');
+    lines.push('本节剧情要点:');
+    plots.forEach((p, i) => lines.push(`${i + 1}. ${String(p).replace(/\n/g, ' ')}`));
+  }
+  return lines.join('\n');
+}
+
+/** 把 liveProgress 渲染成 HTML(人物档案 + 剧情；人物链单独在大总结最下方)。 */
+function liveProgressToHtml(lp) {
+  if (!lp) return '';
+  const loc = `第 ${lp.actNo || '?'} 章 第 ${lp.secNo || '?'} 节`;
+  const chars = Array.isArray(lp.characters) ? lp.characters : [];
+  const plots = Array.isArray(lp.plot) ? lp.plot : [];
+  const charRows = chars.length
+    ? chars.map((c) => `<tr><td>${esc(c.name || '')}</td><td>${esc(c.detail || '')}</td></tr>`).join('')
+    : `<tr><td colspan="2" class="ns-muted">（无）</td></tr>`;
+  const plotRows = plots.length
+    ? plots.map((p, i) => `<tr><td>${i + 1}</td><td>${esc(p)}</td></tr>`).join('')
+    : '';
+  return `
+    <div class="ns-live-progress">
+      <div class="ns-live-progress__title"><strong>当前最新进度 · 动态总结</strong><span class="ns-muted">（${esc(loc)}）</span></div>
+      <div class="ns-muted" style="margin:4px 0 6px;">人物档案随每节更新。</div>
+      <table class="ns-table"><thead><tr><th>人物</th><th>当前状态/关系/目标</th></tr></thead><tbody>${charRows}</tbody></table>
+      ${
+        plotRows
+          ? `<table class="ns-table"><thead><tr><th>序</th><th>本节剧情要点</th></tr></thead><tbody>${plotRows}</tbody></table>`
+          : ''
+      }
+    </div>`;
+}
+
+/**
+ * 大总结: 全书章节总结 + 最新进度人物档案 + 最下方人物链。
  */
 function buildGrandSummary(obj) {
   const parts = [];
@@ -840,9 +1255,189 @@ function buildGrandSummary(obj) {
       .join('\n\n');
     parts.push(`【全书章节总结汇总】\n${body}`);
   }
-  const excerpt = latestSectionExcerpt(obj);
-  if (excerpt) parts.push(excerpt);
+  if (obj.liveProgress) {
+    parts.push(liveProgressToText(obj.liveProgress));
+  } else {
+    const excerpt = latestSectionExcerpt(obj);
+    if (excerpt) parts.push(excerpt);
+  }
+  // 人物链始终放在最下方
+  const chains = collectCharChains(obj);
+  if (chains.length || obj.liveProgress || sums.length) {
+    parts.push(charChainsToText(chains));
+  }
   return parts.join('\n\n');
+}
+
+/** 大总结 HTML(面板展示用)：人物链固定在最下方。 */
+function buildGrandSummaryHtml(obj) {
+  const parts = [];
+  const sums = Array.isArray(obj?.summaries) ? obj.summaries : [];
+  if (sums.length) {
+    const body = sums
+      .map((s) => `● 第${s.actNo}章${s.actTitle ? '「' + s.actTitle + '」' : ''}总结\n${summaryToTable(s)}`)
+      .join('\n\n');
+    parts.push(`<div class="ns-grand-archived"><strong>【全书章节总结汇总】</strong><br>${esc(body).replace(/\n/g, '<br>')}</div>`);
+  }
+  if (obj?.liveProgress) {
+    parts.push(liveProgressToHtml(obj.liveProgress));
+  } else {
+    const excerpt = latestSectionExcerpt(obj);
+    if (excerpt) parts.push(`<div class="ns-grand-archived">${esc(excerpt).replace(/\n/g, '<br>')}</div>`);
+  }
+  // 固定最下方：人物链 A → B → C
+  parts.push(charChainsToHtml(collectCharChains(obj)));
+  return parts.length ? parts.join('') : '（暂无内容，生成节后自动汇总）';
+}
+
+/** 规整动态进度对象。 */
+function normalizeLiveProgress(obj) {
+  const { characters, plot } = normalizeSummaryObj(obj);
+  let charChains = [];
+  if (Array.isArray(obj?.charChains)) {
+    charChains = obj.charChains
+      .map((c) => {
+        if (typeof c === 'string') return { name: c, chain: [] };
+        const chain = Array.isArray(c?.chain)
+          ? c.chain.map((x) => String(x || '').trim()).filter(Boolean)
+          : typeof c?.chain === 'string'
+            ? String(c.chain)
+                .split(/\s*→\s*|\s*->\s*|\s*=>\s*/)
+                .map((x) => x.trim())
+                .filter(Boolean)
+            : [];
+        return { name: c?.name || '', chain };
+      })
+      .filter((c) => c.name || c.chain.length);
+  }
+  // 若未给人物链，用人物档案当前状态作为链的起点
+  if (!charChains.length && characters.length) {
+    charChains = characters.map((c) => ({ name: c.name, chain: c.detail ? [c.detail] : [] }));
+  }
+  charChains = charChains.map((c) => ({ name: c.name, chain: dedupeChainSteps(c.chain) }));
+  return { characters, plot, charChains };
+}
+
+/** 解析动态进度 JSON。 */
+function parseLiveProgress(text) {
+  let t = String(text || '').trim();
+  t = t.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+  const jsonStr = extractBalancedJson(t) || t;
+  try {
+    const r = normalizeLiveProgress(JSON.parse(jsonStr));
+    if (r.characters.length || r.charChains.length || r.plot.length) return r;
+  } catch (e) {
+    /* fallthrough */
+  }
+  // 降级: 复用章节总结解析，再补人物链
+  const base = parseSummary(text);
+  return normalizeLiveProgress({ ...base, charChains: (base.characters || []).map((c) => ({ name: c.name, chain: c.detail ? [c.detail] : [] })) });
+}
+
+/** 构建「最新进度动态总结」提示词：人物链必须覆盖从头到本节的全部演变。 */
+function buildLiveProgressPrompt(obj, actIdx, secIdx) {
+  const act = obj.acts[actIdx];
+  const sec = act.sections[secIdx];
+  const prevChains = mergeCharChains(charChainsFromSummaries(obj), obj.liveProgress?.charChains || []);
+  const system = [
+    '你是小说动态进度归档助手。请根据【全书已有人物状态时间线素材】与【截至本节的正文】，更新「当前最新进度」。',
+    '必须只输出一个合法 JSON 对象，不要输出任何多余文字或代码块标记。严格使用如下格式:',
+    '{"characters":[{"name":"角色名","detail":"当前状态/关系/目标"}],"charChains":[{"name":"角色名","chain":["状态A","状态B","状态C"]}],"plot":["本节关键剧情要点1","要点2"]}',
+    '规则(务必遵守):',
+    '1. characters: 覆盖从头到本节出现过的主要人物，detail 为截至本节结束的最新状态(一句即可)。',
+    '2. charChains: 只在「实质性剧情变化」时追加节点(身份变化/立场转变/重大事件后果等)。每个节点 12~36 字，只写变化点。',
+    '3. 严禁用不同措辞反复描述同一处境(例如多次写清洁工恐惧清理、被威胁)；同一处境只保留 1 个节点。',
+    '4. 若提供了【必须保留的既有人物链】：保留其不重复的有效节点；发现近义重复则合并为一条，可在末尾追加真正的新变化。',
+    '5. plot: 只写本节推进的关键要点，3-6 条为宜。',
+    '6. 不要编造从未出现的人物。',
+  ].join('\n');
+  const hist = allSummariesCharHistoryText(obj);
+  const corpus = collectSectionsCorpus(obj, actIdx, secIdx);
+  const user = [
+    prevChains.length ? `【既有人物链(请去重近义复述后再输出完整链)】\n${charChainsToText(prevChains)}` : '',
+    hist ? `【各章总结中的人物状态(按章序)】\n${hist}` : '',
+    obj.liveProgress ? `【上一版最新进度人物档案】\n${liveProgressToText(obj.liveProgress)}` : '',
+    corpus
+      ? `【截至本节的全部正文素材(第1章第1节 → 第${actIdx + 1}章第${secIdx + 1}节)】\n${corpus}`
+      : `【本节正文: 第${actIdx + 1}章 第${secIdx + 1}节】\n${sec.content || ''}`,
+    '请输出更新后的 JSON。人物链须覆盖真实演变，且不得出现近义重复节点:',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+  return { system, user };
+}
+
+/**
+ * 每节生成后更新动态最新进度(人物档案表 + 人物链)。
+ * 人物链与既有链合并，保证从头到最新节的节点不被 AI 截断丢失。
+ */
+async function updateLiveProgress(obj, actIdx, secIdx, onProgress, { saveFn, isCancelled } = {}) {
+  if (!obj || !obj.acts?.[actIdx]?.sections?.[secIdx]?.content) return;
+  if (isCancelled?.()) return;
+  try {
+    onProgress?.(`正在更新最新进度/人物链(第${actIdx + 1}章 第${secIdx + 1}节，含全文历史)…`, true);
+    const prevChains = mergeCharChains(charChainsFromSummaries(obj), obj.liveProgress?.charChains || []);
+    const { system, user } = buildLiveProgressPrompt(obj, actIdx, secIdx);
+    const gid = `live_${Date.now()}_${actIdx}_${secIdx}`;
+    const raw = (await novelGenerateWithId({ system, user }, gid, isCancelled)).trim();
+    if (isCancelled?.()) return;
+    const parsed = parseLiveProgress(raw);
+    // 合并后近义去重，避免同处境不同措辞反复追加
+    let mergedChains = mergeCharChains(prevChains, parsed.charChains);
+    for (const c of parsed.characters || []) {
+      const d = String(c.detail || '').trim();
+      if (!c.name || !d) continue;
+      const hit = mergedChains.find((x) => normCharName(x.name) === normCharName(c.name));
+      if (hit) appendChainStep(hit.chain, d);
+      else mergedChains.push({ name: c.name, chain: [d] });
+    }
+    mergedChains = mergedChains.map((c) => ({ name: c.name, chain: dedupeChainSteps(c.chain) }));
+    obj.liveProgress = {
+      actNo: actIdx + 1,
+      secNo: secIdx + 1,
+      characters: parsed.characters,
+      charChains: mergedChains,
+      plot: parsed.plot,
+      updatedAt: Date.now(),
+    };
+    saveFn?.();
+    log.info(`已更新最新进度动态总结`, {
+      loc: `${actIdx + 1}-${secIdx + 1}`,
+      characters: parsed.characters.length,
+      chains: mergedChains.length,
+      chainNodes: mergedChains.reduce((n, c) => n + (c.chain?.length || 0), 0),
+    });
+    onProgress?.(`最新进度与人物链已更新(第${actIdx + 1}章 第${secIdx + 1}节)`, true);
+  } catch (e) {
+    log.warn('更新最新进度动态总结失败:', e);
+    onProgress?.(`最新进度更新失败: ${e.message}`, true);
+  }
+}
+
+/**
+ * 从第1章第1节到最新节，整本重建人物链与最新进度(用于「全部重新总结」)。
+ * 一次调用带齐全书素材，再与各章总结确定性合并。
+ */
+async function rebuildLiveProgressFull(obj, onProgress, { saveFn, isCancelled } = {}) {
+  const last = findLastDoneSection(obj);
+  if (!last) {
+    obj.liveProgress = null;
+    saveFn?.();
+    return;
+  }
+  onProgress?.(`正在按「第1章第1节 → 第${last.actIdx + 1}章第${last.secIdx + 1}节」重建完整人物链…`, true);
+  // 清空旧 live 链，避免脏数据；章总结链仍会作为前缀合并进去
+  const keepChars = obj.liveProgress?.characters || [];
+  obj.liveProgress = {
+    actNo: last.actIdx + 1,
+    secNo: last.secIdx + 1,
+    characters: keepChars,
+    charChains: charChainsFromSummaries(obj),
+    plot: [],
+    updatedAt: Date.now(),
+  };
+  saveFn?.();
+  await updateLiveProgress(obj, last.actIdx, last.secIdx, onProgress, { saveFn, isCancelled });
 }
 
 /** 把 summary 渲染成 Markdown 表格文本(供注入 prompt 与展示)。 */
@@ -899,32 +1494,38 @@ function preloadWorldDefsText(proj) {
 }
 
 /** 构建"写某一节"的提示词: 先预读所属章总览, 再写本节。 */
-function buildSectionPrompt(proj, actIdx, secIdx, flatIdx) {
+function buildSectionPrompt(proj, actIdx, secIdx, flatIdx, { reinforce = false } = {}) {
   const act = proj.acts[actIdx];
   const sec = act.sections[secIdx];
 
-  // ── System: 预设 → 全局提示词 → 写作助手说明 ──
+  // ── System: 预设 → 全局提示词 → (可选预读) → 写作助手说明；各块只放一次 ──
   const presetSys = readSysPrompt();
   const globalKw = readGlobalKeyword();
-  const preloadText = preloadWorldDefsText(proj); // worldDefs.preload 开启时带入 system
+  const preloadOn = !!(proj?.worldDefs?.preload);
+  const preloadText = preloadWorldDefsText(proj); // preload 开启时含设定+总结，仅进 system
   const system = [
-    presetSys || null,       // 1. 预设 System Prompt
-    globalKw || null,        // 2. 全局提示词
-    preloadText || null,     // 3. 预读取世界设定+总结（preload开启时）
+    presetSys || null,
+    globalKw || null,
+    preloadText || null,
     '你是专业的中文小说写作助手。本作品按"章-节"结构编写。',
     '请先理解【本章总览】把握本章走向，再根据【背景设定】【世界设定】【长期记忆】【前文】和【本节大纲】续写本节正文。',
     '要求：只输出本节正文，不要输出标题/大纲/解释/多余标记；严格遵守世界设定；与前文及本章走向连贯；文笔流畅。',
+    reinforce
+      ? '重要：上一轮出现了空回复。本次必须输出完整可读的本节正文（至少数百字），禁止只输出空白、省略号或极短占位。'
+      : null,
   ].filter(Boolean).join('\n\n');
 
-  // ── User: 始终包含背景/设定/记忆（preload开启时system已有一份，user再带一份做双重保障）──
+  // ── User: preload 已带设定/总结时不再重复，避免提示词查看器里出现两份 ──
   const user = [
     proj.background ? `【背景设定】\n${proj.background}` : '',
-    entitiesText(proj),                 // 世界设定（始终注入）
-    buildGrandSummary(proj),            // 大总结记忆（始终注入）
+    preloadOn ? '' : entitiesText(proj),
+    preloadOn ? '' : buildGrandSummary(proj),
     recentSectionContext(proj, flatIdx, 2),
     `【本章总览】(第${actIdx + 1}章 ${act.title || ''})\n${act.overview || '(未填写章总览)'}`,
     `【本节大纲】(第${actIdx + 1}章 第${secIdx + 1}节)\n${sec.outline || ''}`,
-    `请开始写第${actIdx + 1}章 第${secIdx + 1}节正文:`,
+    reinforce
+      ? `请重新完整撰写第${actIdx + 1}章 第${secIdx + 1}节正文（必须有实质内容，禁止空输出）:`
+      : `请开始写第${actIdx + 1}章 第${secIdx + 1}节正文:`,
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -1071,7 +1672,7 @@ function parseSummary(text) {
 
 /** 生成某一节正文; flatIdx 为该节在展平序列中的下标(用于动画高亮)。 */
 /** skipSummary=true 时跳过触发总结(单节重新生成时使用, 避免干扰生成流程) */
-async function generateSection(proj, actIdx, secIdx, flatIdx, onProgress, { skipSummary = false } = {}) {
+async function generateSection(proj, actIdx, secIdx, flatIdx, onProgress, { skipSummary = false, reinforce = false } = {}) {
   const act = proj.acts[actIdx];
   const sec = act.sections[secIdx];
   if (isSectionLocked(sec)) {
@@ -1080,19 +1681,62 @@ async function generateSection(proj, actIdx, secIdx, flatIdx, onProgress, { skip
   }
   // 开始写"某章第一节"时, 先对之前所有已完成但未总结的章做整章总结(重新生成时跳过)
   if (secIdx === 0 && !skipSummary) await summarizePendingActs(proj, actIdx, onProgress);
-  const { system, user } = buildSectionPrompt(proj, actIdx, secIdx, flatIdx);
-  onProgress?.(`正在生成第 ${actIdx + 1} 章 第 ${secIdx + 1} 节…`, true);
+
+  // 生成前确保不带着空内容的 done 状态，避免后续流程把它当「已完成」
+  sec.content = '';
+  sec.done = false;
+
   novelState.activeFlatIdx = flatIdx;
   novelState.activeActIdx = actIdx;
   renderNovelChapters();
+
+  let text = '';
   try {
-    const text = (await novelGenerate({ system, user })).trim();
+    const maxPasses = 2;
+    for (let pass = 0; pass < maxPasses; pass++) {
+      const needReinforce = reinforce || pass > 0;
+      const { system, user } = buildSectionPrompt(proj, actIdx, secIdx, flatIdx, { reinforce: needReinforce });
+      onProgress?.(
+        pass === 0
+          ? `正在生成第 ${actIdx + 1} 章 第 ${secIdx + 1} 节…`
+          : `第 ${actIdx + 1} 章 第 ${secIdx + 1} 节空回，正在加强提示后重试…`,
+        true,
+      );
+      try {
+        text = (await novelGenerate({ system, user }, { minLen: MIN_SECTION_CHARS })).trim();
+      } catch (e) {
+        if (pass < maxPasses - 1 && /空回复/.test(String(e.message || ''))) {
+          log.warn(`节生成空回，准备第 ${pass + 2} 轮:`, e.message);
+          resetGenerationChannel('novel', { hard: false });
+          continue;
+        }
+        sec.content = '';
+        sec.done = false;
+        touchProject(proj);
+        throw e;
+      }
+      if (!isEmptyReply(text, MIN_SECTION_CHARS)) break;
+      log.warn(`第 ${actIdx + 1} 章 第 ${secIdx + 1} 节结果过短(${text.length}字)，重试…`);
+      resetGenerationChannel('novel', { hard: false });
+      text = '';
+    }
+
+    if (isEmptyReply(text, MIN_SECTION_CHARS)) {
+      sec.content = '';
+      sec.done = false;
+      touchProject(proj);
+      throw new Error(`第 ${actIdx + 1} 章 第 ${secIdx + 1} 节生成结果为空，请稍后重新生成`);
+    }
+
     sec.content = text;
     sec.done = true;
     sec.updatedAt = Date.now();
     touchProject(proj);
-    novelState.activeFlatIdx = -1;
-    // 每节生成后刷新大总结（latestSectionExcerpt 有了新内容）
+    // 仅在有效正文时更新动态总结
+    await updateLiveProgress(proj, actIdx, secIdx, onProgress, {
+      saveFn: () => touchProject(proj),
+      isCancelled: () => novelState.cancelRequested,
+    });
     refreshGrandSummary(proj, `#${EXT_ID}-novel`);
     return text;
   } finally {
@@ -1110,21 +1754,37 @@ async function summarizePendingActs(proj, beforeActIdx, onProgress) {
   }
 }
 
-/** 该大章已有表格总结则跳过, 否则生成并存档。 */
-async function maybeSummarizeAct(proj, actIdx, onProgress) {
+/** 该大章已有表格总结则跳过, 否则生成并存档。force=true 时允许章未写完(有正文即可)强制重总结。 */
+async function maybeSummarizeAct(proj, actIdx, onProgress, { force = false } = {}) {
   const actNo = actIdx + 1;
   const act = proj.acts[actIdx];
-  if (!act || !isActComplete(act)) {
-    log.debug(`第 ${actNo} 章未完成或不存在, 跳过总结`);
+  if (!act) {
+    log.debug(`第 ${actNo} 章不存在, 跳过总结`);
     return;
   }
-  if (proj.summaries.some((s) => s.actNo === actNo)) {
-    log.debug(`第 ${actNo} 章已有总结, 跳过`);
-    return;
+  if (force) {
+    if (!actHasGeneratedContent(act)) {
+      log.debug(`第 ${actNo} 章尚无正文, 跳过强制总结`);
+      return;
+    }
+    proj.summaries = (proj.summaries || []).filter((s) => s.actNo !== actNo);
+  } else {
+    if (!isActComplete(act)) {
+      log.debug(`第 ${actNo} 章未完成或不存在, 跳过总结`);
+      return;
+    }
+    if (proj.summaries.some((s) => s.actNo === actNo)) {
+      log.debug(`第 ${actNo} 章已有总结, 跳过`);
+      return;
+    }
   }
   try {
-    log.info(`开始生成第 ${actNo} 章整章表格总结…`);
-    onProgress?.(`第 ${actNo} 章已写完, 正在生成整章表格总结…`, true);
+    const partial = !isActComplete(act);
+    log.info(`开始生成第 ${actNo} 章整章表格总结${partial ? '(未完成章·强制)' : ''}…`);
+    onProgress?.(
+      partial ? `正在强制总结第 ${actNo} 章(尚未写完，仅已有正文)…` : `第 ${actNo} 章已写完, 正在生成整章表格总结…`,
+      true,
+    );
     const { system, user } = buildActSummaryPrompt(proj, actIdx);
     const raw = (await novelGenerate({ system, user })).trim();
     log.debug(`第 ${actNo} 章总结原始返回:`, raw.slice(0, 200));
@@ -1138,11 +1798,12 @@ async function maybeSummarizeAct(proj, actIdx, onProgress) {
       characters: parsed.characters,
       plot: parsed.plot,
       createdAt: Date.now(),
+      partial: partial || undefined,
     });
     touchProject(proj);
     renderNovelSummaries(); // 实时刷新总结区
-    log.info(`已生成第 ${actNo} 章表格总结`, { characters: parsed.characters.length, plot: parsed.plot.length });
-    onProgress?.(`第 ${actNo} 章表格总结已存档`, true);
+    log.info(`已生成第 ${actNo} 章表格总结`, { characters: parsed.characters.length, plot: parsed.plot.length, partial });
+    onProgress?.(`第 ${actNo} 章表格总结已存档${partial ? '(未完成章)' : ''}`, true);
   } catch (e) {
     log.warn('整章总结失败:', e);
     onProgress?.(`整章总结失败: ${e.message}`, true);
@@ -1411,6 +2072,7 @@ function getContinuation() {
   if (cont) {
     ensureActs(cont);
     if (!Array.isArray(cont.summaries)) cont.summaries = [];
+    if (sanitizeEmptyDoneSections(cont)) saveContinuation();
   }
   return cont;
 }
@@ -1430,6 +2092,7 @@ function createContinuation(title) {
     targetChapters: 5,
     acts: [],
     summaries: [],
+    liveProgress: null,
   };
   getContinuations().push(cont);
   s.activeContinuationId = cont.id;
@@ -1469,18 +2132,21 @@ function contRecentTail(cont, flatIdx, chars = 1200) {
 }
 
 /** 构建续写某节的提示词。mode: outline=按大纲(读章总览+节大纲) / free=自然续写。 */
-function buildContSectionPrompt(cont, actIdx, secIdx, flatIdx, mode) {
+function buildContSectionPrompt(cont, actIdx, secIdx, flatIdx, mode, { reinforce = false } = {}) {
   const act = cont.acts[actIdx];
   const sec = act.sections[secIdx];
 
-  // ── System: 预设 → 全局提示词 → 续写助手说明 ──
+  // ── System: 预设 / 全局提示词各一份（generateRaw 期间会清空扩展注入，避免叠两份）──
   const presetSys = readSysPrompt();
   const globalKw = readGlobalKeyword();
   const sysLines = [
-    presetSys || null,   // 1. 预设 System Prompt
-    globalKw || null,    // 2. 全局提示词
-    '你是专业的中文小说续写助手。请在保持原作人物、设定、文风、剧情逻辑连贯的前提下续写。', // 3. 插件说明
+    presetSys || null,
+    globalKw || null,
+    '你是专业的中文小说续写助手。请在保持原作人物、设定、文风、剧情逻辑连贯的前提下续写。',
     '要求：只输出续写正文，不要输出标题/解释/大纲/多余标记；与前文自然衔接。',
+    reinforce
+      ? '重要：上一轮出现了空回复。本次必须输出完整可读的本节正文（至少数百字），禁止只输出空白、省略号或极短占位。'
+      : null,
   ].filter(Boolean);
   if (mode === 'free') sysLines.push('本次为自然续写：请根据原文走向与人物剧情，自主推进剧情，写出承接前文的下一节。');
   else sysLines.push('本次为按大纲续写：本作品按"章-节"结构，请先理解【本章总览】再严格围绕【本节大纲】展开本节正文。');
@@ -1495,7 +2161,9 @@ function buildContSectionPrompt(cont, actIdx, secIdx, flatIdx, mode) {
     recentTail ? `【上一节结尾】\n${recentTail}` : '',                                    // 前文
     mode === 'outline' ? `【本章总览】(第${actIdx + 1}章 ${act.title || ''})\n${act.overview || '(未填写)'}` : '', // 章总览
     mode === 'outline' ? `【本节大纲】(第${actIdx + 1}章 第${secIdx + 1}节)\n${sec.outline || ''}` : '',          // 节大纲
-    `请续写第 ${actIdx + 1} 章 第 ${secIdx + 1} 节正文:`,
+    reinforce
+      ? `请重新完整续写第 ${actIdx + 1} 章 第 ${secIdx + 1} 节正文（必须有实质内容，禁止空输出）:`
+      : `请续写第 ${actIdx + 1} 章 第 ${secIdx + 1} 节正文:`,
   ].filter(Boolean);
   return { system: sysLines.join('\n\n'), user: parts.join('\n\n') };
 }
@@ -1531,7 +2199,7 @@ function resetAllContent() {
 }
 
 /** skipSummary=true 时跳过触发总结(单节重新生成时使用) */
-async function generateContSection(cont, actIdx, secIdx, flatIdx, mode, onProgress, { skipSummary = false } = {}) {
+async function generateContSection(cont, actIdx, secIdx, flatIdx, mode, onProgress, { skipSummary = false, reinforce = false } = {}) {
   const act = cont.acts[actIdx];
   const sec = act.sections[secIdx];
   if (isSectionLocked(sec)) {
@@ -1540,21 +2208,62 @@ async function generateContSection(cont, actIdx, secIdx, flatIdx, mode, onProgre
   }
   // 开始写"某章第一节"时, 先对之前已完成但未总结的章做整章总结(重新生成时跳过)
   if (secIdx === 0 && !skipSummary) await summarizePendingContActs(cont, actIdx, onProgress);
-  const { system, user } = buildContSectionPrompt(cont, actIdx, secIdx, flatIdx, mode);
-  onProgress?.(`正在续写第 ${actIdx + 1} 章 第 ${secIdx + 1} 节…`, true);
-  const gid = `cont_${Date.now()}_${flatIdx}`;
-  contState.currentGenId = gid;
+
+  sec.content = '';
+  sec.done = false;
+
   contState.activeFlatIdx = flatIdx;
   contState.activeActIdx = actIdx;
   renderContinuationChapters();
+
+  let text = '';
   try {
-    const text = (await novelGenerateWithId({ system, user }, gid, () => contState.cancelRequested)).trim();
+    const maxPasses = 2;
+    for (let pass = 0; pass < maxPasses; pass++) {
+      const needReinforce = reinforce || pass > 0;
+      const { system, user } = buildContSectionPrompt(cont, actIdx, secIdx, flatIdx, mode, { reinforce: needReinforce });
+      onProgress?.(
+        pass === 0
+          ? `正在续写第 ${actIdx + 1} 章 第 ${secIdx + 1} 节…`
+          : `续写第 ${actIdx + 1} 章 第 ${secIdx + 1} 节空回，正在加强提示后重试…`,
+        true,
+      );
+      const gid = `cont_${Date.now()}_${flatIdx}_p${pass}`;
+      contState.currentGenId = gid;
+      try {
+        text = (await novelGenerateWithId({ system, user }, gid, () => contState.cancelRequested, { minLen: MIN_SECTION_CHARS })).trim();
+      } catch (e) {
+        if (pass < maxPasses - 1 && /空回复/.test(String(e.message || ''))) {
+          log.warn(`续写空回，准备第 ${pass + 2} 轮:`, e.message);
+          resetGenerationChannel('cont', { hard: false });
+          continue;
+        }
+        sec.content = '';
+        sec.done = false;
+        saveContinuation();
+        throw e;
+      }
+      if (!isEmptyReply(text, MIN_SECTION_CHARS)) break;
+      log.warn(`续写第 ${actIdx + 1} 章 第 ${secIdx + 1} 节结果过短(${text.length}字)，重试…`);
+      resetGenerationChannel('cont', { hard: false });
+      text = '';
+    }
+
+    if (isEmptyReply(text, MIN_SECTION_CHARS)) {
+      sec.content = '';
+      sec.done = false;
+      saveContinuation();
+      throw new Error(`续写第 ${actIdx + 1} 章 第 ${secIdx + 1} 节生成结果为空，请稍后重新生成`);
+    }
+
     sec.content = text;
     sec.done = true;
     sec.updatedAt = Date.now();
     saveContinuation();
-    contState.activeFlatIdx = -1;
-    // 每节生成后刷新大总结
+    await updateLiveProgress(cont, actIdx, secIdx, onProgress, {
+      saveFn: () => saveContinuation(),
+      isCancelled: () => contState.cancelRequested,
+    });
     refreshGrandSummary(getContinuation(), `#${EXT_ID}-analyze`);
     return text;
   } finally {
@@ -1573,14 +2282,25 @@ async function summarizePendingContActs(cont, beforeActIdx, onProgress) {
 }
 
 /** 续写: 生成整章表格总结并存档。 */
-async function maybeSummarizeContAct(cont, actIdx, onProgress) {
+/** 续写: 生成整章表格总结并存档。force=true 时允许章未写完强制重总结。 */
+async function maybeSummarizeContAct(cont, actIdx, onProgress, { force = false } = {}) {
   const actNo = actIdx + 1;
   const act = cont.acts[actIdx];
-  if (!act || !isActComplete(act)) return;
-  if (cont.summaries.some((s) => s.actNo === actNo)) return;
+  if (!act) return;
+  if (force) {
+    if (!actHasGeneratedContent(act)) return;
+    cont.summaries = (cont.summaries || []).filter((s) => s.actNo !== actNo);
+  } else {
+    if (!isActComplete(act)) return;
+    if (cont.summaries.some((s) => s.actNo === actNo)) return;
+  }
   try {
-    log.info(`开始生成续写第 ${actNo} 章整章表格总结…`);
-    onProgress?.(`正在为续写第 ${actNo} 章生成整章表格总结…`, true);
+    const partial = !isActComplete(act);
+    log.info(`开始生成续写第 ${actNo} 章整章表格总结${partial ? '(未完成章·强制)' : ''}…`);
+    onProgress?.(
+      partial ? `正在强制总结续写第 ${actNo} 章(尚未写完，仅已有正文)…` : `正在为续写第 ${actNo} 章生成整章表格总结…`,
+      true,
+    );
     const { system, user } = buildActSummaryPrompt(cont, actIdx);
     const raw = (await novelGenerateWithId({ system, user }, `cont_sum_${Date.now()}`, () => contState.cancelRequested)).trim();
     log.debug(`续写第 ${actNo} 章总结原始返回:`, raw.slice(0, 200));
@@ -1588,11 +2308,18 @@ async function maybeSummarizeContAct(cont, actIdx, onProgress) {
     if (!parsed.characters.length && !parsed.plot.length) {
       log.warn(`续写第 ${actNo} 章总结解析为空, 原始文本:`, raw.slice(0, 400));
     }
-    cont.summaries.push({ actNo, actTitle: cont.acts[actIdx].title || '', characters: parsed.characters, plot: parsed.plot, createdAt: Date.now() });
+    cont.summaries.push({
+      actNo,
+      actTitle: cont.acts[actIdx].title || '',
+      characters: parsed.characters,
+      plot: parsed.plot,
+      createdAt: Date.now(),
+      partial: partial || undefined,
+    });
     saveContinuation();
     renderContSummaries();
-    log.info(`已生成续写第 ${actNo} 章表格总结`, { characters: parsed.characters.length, plot: parsed.plot.length });
-    onProgress?.(`第 ${actNo} 章表格总结已存档`, true);
+    log.info(`已生成续写第 ${actNo} 章表格总结`, { characters: parsed.characters.length, plot: parsed.plot.length, partial });
+    onProgress?.(`第 ${actNo} 章表格总结已存档${partial ? '(未完成章)' : ''}`, true);
   } catch (e) {
     log.warn('续写整章总结失败:', e);
   }
@@ -1638,6 +2365,7 @@ function resetContSections(cont) {
   if ((cont.mode || 'outline') === 'free') {
     cont.acts = [];
     cont.summaries = [];
+    cont.liveProgress = null;
   } else {
     for (const act of cont.acts || []) {
       for (const sec of act.sections || []) {
@@ -1650,6 +2378,7 @@ function resetContSections(cont) {
     }
     if (!flatSections(cont).some((f) => f.sec.locked)) cont.summaries = [];
   }
+  cont.liveProgress = null;
   contState.activeActIdx = -1;
   saveContinuation();
 }
@@ -1662,14 +2391,14 @@ async function runContOutlineManual(cont) {
     return;
   }
   let flat = flatSections(cont);
-  let target = flat.find((f) => !f.sec.done);
+  let target = flat.find((f) => !hasValidSectionContent(f.sec));
   if (!target) {
     // 全部完成: 询问是否从头重新生成
     if (!globalThis.confirm?.('当前生成已完成，是否全部重新生成？')) return;
     resetContSections(cont);
     renderAnalyzeUI();
     flat = flatSections(cont);
-    target = flat.find((f) => !f.sec.done);
+    target = flat.find((f) => !hasValidSectionContent(f.sec));
     if (!target) return;
   }
   await withContGenerating(async () => {
@@ -1687,7 +2416,7 @@ async function runContOutlineAuto(cont) {
     return;
   }
   // 全部完成: 询问是否从头重新生成
-  if (!flatSections(cont).some((f) => !f.sec.done)) {
+  if (!flatSections(cont).some((f) => !hasValidSectionContent(f.sec))) {
     if (!globalThis.confirm?.('当前生成已完成，是否全部重新生成？')) return;
     resetContSections(cont);
     renderAnalyzeUI();
@@ -1699,7 +2428,7 @@ async function runContOutlineAuto(cont) {
         break;
       }
       const flat = flatSections(cont);
-      const target = flat.find((f) => !f.sec.done);
+      const target = flat.find((f) => !hasValidSectionContent(f.sec));
       if (!target) break;
       await generateContSection(cont, target.actIdx, target.secIdx, target.flatIdx, 'outline', setContHint);
       renderContinuationChapters();
@@ -1963,7 +2692,7 @@ function ensurePanel() {
           </div>
           <div class="ns-card" id="${EXT_ID}-idea"></div>
         </div>
-        <div class="ns-panel__footer"><span class="ns-muted">${EXT_NAME} v2.1</span></div>
+        <div class="ns-panel__footer"><span class="ns-muted">${EXT_NAME} v2.2</span></div>
       </div>
     </div>`;
   $('body').append(html);
@@ -2221,9 +2950,14 @@ function contChapterListHtml(cont) {
             ? `<div class="ns-chapter__gen"><span class="ns-gen-label"><i class="fa-solid fa-spinner fa-spin"></i> 生成中…</span>
                  <div class="ns-progress"><div class="ns-progress__bar ns-progress__bar--indef"></div></div></div>`
             : '';
+          const valid = hasValidSectionContent(sec);
           const tag = generating
             ? `<span class="ns-tag ns-tag--gen">生成中</span>`
-            : `<span class="ns-tag ${sec.done ? 'ns-tag--done' : ''}">${sec.done ? '已生成' : '未生成'}</span>`;
+            : valid
+              ? `<span class="ns-tag ns-tag--done">已生成</span>`
+              : sec.done
+                ? `<span class="ns-tag">空回·待重生</span>`
+                : `<span class="ns-tag">未生成</span>`;
           const outlineField =
             mode === 'outline'
               ? `<textarea class="ns-ct-sec-outline" data-a="${ai}" data-s="${si}" rows="1" placeholder="本节大纲…">${esc(sec.outline || '')}</textarea>`
@@ -2239,7 +2973,8 @@ function contChapterListHtml(cont) {
               ${genBlock}
               ${sec.content ? `<div class="ns-chapter__body">${preview}<span class="ns-wordcount">${sec.content.length} 字</span></div>` : ''}
               <div class="ns-chapter__actions">
-                ${!locked && sec.done ? `<button class="ns-btn ns-btn--sm" data-act="ct-gen-sec" data-a="${ai}" data-s="${si}" ${contState.generating ? 'disabled' : ''}>重新生成</button>` : ''}
+                ${!locked && (valid || sec.done) ? `<button class="ns-btn ns-btn--sm" data-act="ct-gen-sec" data-a="${ai}" data-s="${si}" ${contState.generating ? 'disabled' : ''}>重新生成</button>` : ''}
+                ${!locked && !valid && !sec.done ? `<button class="ns-btn ns-btn--sm" data-act="ct-gen-sec" data-a="${ai}" data-s="${si}" ${contState.generating ? 'disabled' : ''}>生成本节</button>` : ''}
                 ${sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="ct-view-sec" data-a="${ai}" data-s="${si}">查看全文</button>` : ''}
                 ${sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="ct-copy-sec" data-a="${ai}" data-s="${si}"><i class="fa-solid fa-copy"></i> 复制</button>` : ''}
                 <span class="ns-chapter__actions-right">
@@ -2270,7 +3005,7 @@ function contChapterListHtml(cont) {
           <div class="ns-act__head">
             <button class="ns-btn ns-btn--icon ns-btn--sm ns-act-fold" data-act="ct-act-fold" data-a="${ai}" title="折叠/展开本章"><i class="fa-solid fa-chevron-${folded ? 'right' : 'down'} ns-act-fold__icon"></i></button>
             <strong>第 ${ai + 1} 章</strong>${actEditable}
-            <span class="ns-tag ${isActComplete(act) ? 'ns-tag--done' : ''}">${(act.sections || []).filter((s) => s.done).length}/${(act.sections || []).length} 节</span>
+            <span class="ns-tag ${isActComplete(act) ? 'ns-tag--done' : ''}">${(act.sections || []).filter((s) => hasValidSectionContent(s)).length}/${(act.sections || []).length} 节</span>
           </div>
           <div class="ns-act__body" ${folded ? 'style="display:none;"' : ''}>
             ${overviewField}
@@ -2376,7 +3111,7 @@ function renderContinuationUI() {
           <strong>整章表格总结（记忆）</strong>
         </div>
         <div class="ns-row" style="padding:4px 10px 0;">
-          <button class="ns-btn ns-btn--sm" data-act="ct-resum" ${contState.generating ? 'disabled' : ''} title="对所有已完成章重新生成总结">全部重新总结</button>
+          <button class="ns-btn ns-btn--sm" data-act="ct-resum" ${contState.generating ? 'disabled' : ''} title="强制重新总结所有已有正文的章（章未写完也可）并重建人物链">全部重新总结</button>
           <button class="ns-btn ns-btn--sm ns-btn--danger" data-act="ct-clear-sum" title="清空所有章节总结">清空总结</button>
         </div>
         <div class="ns-collapse__body ns-collapse__body--summary"${foldBodyStyle('ct-summaries')}>
@@ -2646,6 +3381,7 @@ function bindAnalyzeEvents() {
             sec.done = false;
           }
           cont.summaries = [];
+          cont.liveProgress = null;
           saveContinuation();
           renderAnalyzeUI();
           await runContOutlineAuto(cont);
@@ -2665,6 +3401,7 @@ function bindAnalyzeEvents() {
           cont.targetChapters = Math.max(1, Number($(`#${EXT_ID}-ct-target`).val()) || 5);
           cont.acts = [];
           cont.summaries = [];
+          cont.liveProgress = null;
           saveContinuation();
           renderAnalyzeUI();
           await runContFree(cont);
@@ -2688,14 +3425,19 @@ function bindAnalyzeEvents() {
           const si = Number($(this).data('s'));
           if (Number.isInteger(ai) && Number.isInteger(si) && cont.acts[ai]?.sections[si]) {
             collectContActsFromDOM(cont);
-            // 重新生成前先重置该节状态
             const secToRegen = cont.acts[ai].sections[si];
             secToRegen.done = false;
             secToRegen.content = '';
+            saveContinuation();
             const flat = flatSections(cont);
             const f = flat.find((x) => x.actIdx === ai && x.secIdx === si);
+            resetGenerationChannel('cont', { hard: true });
+            await sleep(350);
             await withContGenerating(async () => {
-              await generateContSection(cont, ai, si, f ? f.flatIdx : -1, cont.mode || 'outline', setContHint, { skipSummary: true });
+              await generateContSection(cont, ai, si, f ? f.flatIdx : -1, cont.mode || 'outline', setContHint, {
+                skipSummary: true,
+                reinforce: true,
+              });
               setContHint(`第 ${ai + 1} 章 第 ${si + 1} 节已重新生成。`);
             });
             renderAnalyzeUI();
@@ -2720,7 +3462,7 @@ function bindAnalyzeEvents() {
       case 'ct-resum':
         if (cont) {
           if (contState.generating) return void toast('请先中止当前生成');
-          if (!globalThis.confirm?.('将清空并重新生成所有已完成章的表格总结，确定继续？')) return;
+          if (!globalThis.confirm?.('将清空并重新生成所有已有正文之章的表格总结（章未写完也可强制总结），并重建最新进度与人物链，确定继续？')) return;
           await withContGenerating(async () => {
             await regenAllContSummaries(cont, setContHint);
             setContHint('全部重新总结完成。');
@@ -3149,9 +3891,14 @@ function novelChapterListHtml(proj) {
             ? `<div class="ns-chapter__gen"><span class="ns-gen-label"><i class="fa-solid fa-spinner fa-spin"></i> 生成中…</span>
                  <div class="ns-progress"><div class="ns-progress__bar ns-progress__bar--indef"></div></div></div>`
             : '';
+          const valid = hasValidSectionContent(sec);
           const tag = generating
             ? `<span class="ns-tag ns-tag--gen">生成中</span>`
-            : `<span class="ns-tag ${sec.done ? 'ns-tag--done' : ''}">${sec.done ? '已生成' : '未生成'}</span>`;
+            : valid
+              ? `<span class="ns-tag ns-tag--done">已生成</span>`
+              : sec.done
+                ? `<span class="ns-tag">空回·待重生</span>`
+                : `<span class="ns-tag">未生成</span>`;
           const locked = isSectionLocked(sec);
           return `
             <div class="ns-section ${generating ? 'ns-chapter--gen' : ''} ${locked ? 'ns-sec-locked' : ''}" data-a="${ai}" data-s="${si}">
@@ -3164,7 +3911,8 @@ function novelChapterListHtml(proj) {
               ${genBlock}
               ${sec.content ? `<div class="ns-chapter__body">${preview}<span class="ns-wordcount">${sec.content.length} 字</span></div>` : ''}
               <div class="ns-chapter__actions">
-                ${!locked && sec.done ? `<button class="ns-btn ns-btn--sm" data-act="gen-sec" data-a="${ai}" data-s="${si}" ${novelState.generating ? 'disabled' : ''}>重新生成</button>` : ''}
+                ${!locked && (valid || sec.done) ? `<button class="ns-btn ns-btn--sm" data-act="gen-sec" data-a="${ai}" data-s="${si}" ${novelState.generating ? 'disabled' : ''}>重新生成</button>` : ''}
+                ${!locked && !valid && !sec.done ? `<button class="ns-btn ns-btn--sm" data-act="gen-sec" data-a="${ai}" data-s="${si}" ${novelState.generating ? 'disabled' : ''}>生成本节</button>` : ''}
                 ${sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="view-sec" data-a="${ai}" data-s="${si}">查看全文</button>` : ''}
                 ${sec.content ? `<button class="ns-btn ns-btn--sm ns-btn--ghost" data-act="copy-sec" data-a="${ai}" data-s="${si}"><i class="fa-solid fa-copy"></i> 复制</button>` : ''}
                 <span class="ns-chapter__actions-right">
@@ -3185,7 +3933,7 @@ function novelChapterListHtml(proj) {
             <button class="ns-btn ns-btn--icon ns-btn--sm ns-act-fold" data-act="act-fold" data-a="${ai}" title="折叠/展开本章"><i class="fa-solid fa-chevron-${folded ? 'right' : 'down'} ns-act-fold__icon"></i></button>
             <strong>第 ${ai + 1} 章</strong>
             <input type="text" class="ns-act-title" data-a="${ai}" value="${esc(act.title || '')}" placeholder="章标题" />
-            <span class="ns-tag ${isActComplete(act) ? 'ns-tag--done' : ''}">${(act.sections || []).filter((s) => s.done).length}/${(act.sections || []).length} 节</span>
+            <span class="ns-tag ${isActComplete(act) ? 'ns-tag--done' : ''}">${(act.sections || []).filter((s) => hasValidSectionContent(s)).length}/${(act.sections || []).length} 节</span>
             <button class="ns-btn ns-btn--icon ns-btn--sm" data-act="act-del" data-a="${ai}" title="删除本章"><i class="fa-solid fa-trash"></i></button>
           </div>
           <div class="ns-act__body" ${folded ? 'style="display:none;"' : ''}>
@@ -3304,10 +4052,12 @@ function renderNovelUI() {
           ${renderWorldDefsUI(proj)}
         </div>
       </div>
+      <div class="ns-row" style="margin-bottom:10px;">
+        <button class="ns-btn ns-btn--sm" data-act="save-bg" title="仅保存背景设定与世界设定">保存背景/设定</button>
+      </div>
       <div class="ns-field">
         <div class="ns-card__head">
           <label>大纲（章 - 节层次，共 ${proj.acts.length} 章 / ${total} 节）</label>
-          <button class="ns-btn ns-btn--sm" data-act="save-meta">保存背景/设定/大纲</button>
         </div>
         <div class="ns-chapters">${chapterList}</div>
         <div class="ns-row"><button class="ns-btn ns-btn--sm" data-act="act-add"><i class="fa-solid fa-plus"></i> 添加章</button></div>
@@ -3315,6 +4065,7 @@ function renderNovelUI() {
       <div class="ns-field">
         <div class="ns-card__head"><label>生成</label><span class="ns-muted" id="${EXT_ID}-nv-hint"></span></div>
         <div class="ns-row">
+          <button class="ns-btn ns-btn--sm" data-act="save-outline" title="仅保存章-节大纲">保存大纲</button>
           <button class="ns-btn" data-act="mode-manual" title="逐节生成，每节需确认或重新生成">手动模式（逐节确认）</button>
           <button class="ns-btn" data-act="mode-auto" title="一次性生成所有未完成节">自动模式（全部生成）</button>
           <button class="ns-btn ns-btn--danger" data-act="stop" ${novelState.generating ? '' : 'disabled'}>中止</button>
@@ -3329,7 +4080,7 @@ function renderNovelUI() {
           <strong>整章表格总结（记忆）</strong>
         </div>
         <div class="ns-row" style="padding:4px 10px 0;">
-          <button class="ns-btn ns-btn--sm" data-act="nv-resum" ${novelState.generating ? 'disabled' : ''} title="对所有已完成章重新生成总结">全部重新总结</button>
+          <button class="ns-btn ns-btn--sm" data-act="nv-resum" ${novelState.generating ? 'disabled' : ''} title="强制重新总结所有已有正文的章（章未写完也可）并重建人物链">全部重新总结</button>
           <button class="ns-btn ns-btn--sm ns-btn--danger" data-act="nv-clear-sum" title="清空所有章节总结">清空总结</button>
         </div>
         <div class="ns-collapse__body ns-collapse__body--summary"${foldBodyStyle('nv-summaries')}>
@@ -3355,8 +4106,7 @@ function renderNovelUI() {
 
 /** 渲染大总结折叠块（状态由 uiFoldState 决定，默认折叠）。 */
 function grandSummaryHtml(obj, foldKey = 'grand') {
-  const text = buildGrandSummary(obj);
-  const body = text ? esc(text).replace(/\n/g, '<br>') : '（暂无内容，生成节后自动汇总）';
+  const body = buildGrandSummaryHtml(obj);
   return `
     <div class="ns-collapse ns-grand-summary" style="margin-bottom:4px;">
       <div class="ns-collapse__head" data-act="summary-toggle" data-fold-key="${foldKey}">
@@ -3373,8 +4123,7 @@ function refreshGrandSummary(obj, containerSel) {
   if (!$) return;
   const $body = $(`${containerSel} .ns-grand-summary__body`);
   if (!$body.length) return;
-  const text = buildGrandSummary(obj);
-  $body.html(text ? esc(text).replace(/\n/g, '<br>') : '（暂无内容，生成节后自动汇总）');
+  $body.html(buildGrandSummaryHtml(obj));
 }
 
 /** 渲染一条整章总结为表格（可折叠；状态由 uiFoldState 决定，默认折叠）。 */
@@ -3402,28 +4151,40 @@ function renderSummaryTable(s, foldPrefix = 'sum') {
     </div>`;
 }
 
-/** 写小说: 清空总结并对所有已完成章重新生成整章表格总结。 */
+/** 写小说: 强制重新总结所有已有正文的章(章未写完也可)，并按全文重建人物链。 */
 async function regenAllSummaries(proj, onProgress) {
   proj.summaries = [];
   touchProject(proj);
   for (let i = 0; i < (proj.acts || []).length; i++) {
-    if (proj.acts[i] && isActComplete(proj.acts[i])) {
-      await maybeSummarizeAct(proj, i, onProgress);
+    if (actHasGeneratedContent(proj.acts[i])) {
+      await maybeSummarizeAct(proj, i, onProgress, { force: true });
       renderNovelSummaries();
     }
   }
+  await rebuildLiveProgressFull(proj, onProgress, {
+    saveFn: () => touchProject(proj),
+    isCancelled: () => novelState.cancelRequested,
+  });
+  refreshGrandSummary(proj, `#${EXT_ID}-novel`);
+  renderNovelSummaries();
 }
 
-/** 续写: 清空总结并对所有已完成章重新生成整章表格总结。 */
+/** 续写: 强制重新总结所有已有正文的章(章未写完也可)，并按全文重建人物链。 */
 async function regenAllContSummaries(cont, onProgress) {
   cont.summaries = [];
   saveContinuation();
   for (let i = 0; i < (cont.acts || []).length; i++) {
-    if (cont.acts[i] && isActComplete(cont.acts[i])) {
-      await maybeSummarizeContAct(cont, i, onProgress);
+    if (actHasGeneratedContent(cont.acts[i])) {
+      await maybeSummarizeContAct(cont, i, onProgress, { force: true });
       renderContSummaries();
     }
   }
+  await rebuildLiveProgressFull(cont, onProgress, {
+    saveFn: () => saveContinuation(),
+    isCancelled: () => contState.cancelRequested,
+  });
+  refreshGrandSummary(cont, `#${EXT_ID}-analyze`);
+  renderContSummaries();
 }
 
 /** 清空写小说所有节的正文/完成状态与总结, 用于从头重新生成。 */
@@ -3439,6 +4200,7 @@ function resetProjSections(proj) {
   }
   // 若有锁定节，不清空总结（锁定内容的总结需保留）
   if (!flatSections(proj).some((f) => f.sec.locked)) proj.summaries = [];
+  proj.liveProgress = null;
   novelState.activeActIdx = -1;
   touchProject(proj);
 }
@@ -3449,13 +4211,13 @@ async function runManualStep(proj) {
   collectActsFromDOM(proj);
   if (!totalSectionCount(proj)) return void setNovelHint('请先添加章与节。');
   let flat = flatSections(proj);
-  let target = flat.find((f) => !f.sec.done);
+  let target = flat.find((f) => !hasValidSectionContent(f.sec));
   if (!target) {
     if (!globalThis.confirm?.('当前生成已完成，是否全部重新生成？')) return;
     resetProjSections(proj);
     renderNovelUI();
     flat = flatSections(proj);
-    target = flat.find((f) => !f.sec.done);
+    target = flat.find((f) => !hasValidSectionContent(f.sec));
     if (!target) return;
   }
   await withGenerating(async () => {
@@ -3471,7 +4233,7 @@ async function runAutoAll(proj) {
   collectActsFromDOM(proj);
   if (!totalSectionCount(proj)) return void setNovelHint('请先添加章与节。');
   // 全部完成: 询问是否从头重新生成
-  if (!flatSections(proj).some((f) => !f.sec.done)) {
+  if (!flatSections(proj).some((f) => !hasValidSectionContent(f.sec))) {
     if (!globalThis.confirm?.('当前生成已完成，是否全部重新生成？')) return;
     resetProjSections(proj);
     renderNovelUI();
@@ -3483,7 +4245,7 @@ async function runAutoAll(proj) {
         break;
       }
       const flat = flatSections(proj);
-      const target = flat.find((f) => !f.sec.done);
+      const target = flat.find((f) => !hasValidSectionContent(f.sec));
       if (!target) break;
       await generateSection(proj, target.actIdx, target.secIdx, target.flatIdx, setNovelHint);
       renderNovelChapters();
@@ -3702,13 +4464,21 @@ function bindNovelEvents() {
           $(`#${EXT_ID}-wd-body`).html(renderWorldDefsUI(proj));
         }
         break;
-      case 'save-meta':
+      case 'save-bg':
         if (proj) {
           proj.background = String($(`#${EXT_ID}-nv-bg`).val() ?? '');
-          collectWorldDefsFromDOM(proj); // 保存当前板块 + preload 状态
+          collectWorldDefsFromDOM(proj);
+          touchProject(proj);
+          setNovelHint('已保存背景与世界设定。');
+          toast('背景/设定已保存');
+        }
+        break;
+      case 'save-outline':
+        if (proj) {
           collectActsFromDOM(proj);
           touchProject(proj);
-          setNovelHint('已保存背景、世界设定与章-节大纲。');
+          setNovelHint('章-节大纲已保存。');
+          toast('大纲已保存');
           renderNovelUI();
         }
         break;
@@ -3734,7 +4504,7 @@ function bindNovelEvents() {
       case 'nv-resum':
         if (proj) {
           if (novelState.generating) return void toast('请先中止当前生成');
-          if (!globalThis.confirm?.('将清空并重新生成所有已完成章的表格总结，确定继续？')) return;
+          if (!globalThis.confirm?.('将清空并重新生成所有已有正文之章的表格总结（章未写完也可强制总结），并重建最新进度与人物链，确定继续？')) return;
           await withGenerating(async () => {
             await regenAllSummaries(proj, setNovelHint);
             setNovelHint('全部重新总结完成。');
@@ -3761,15 +4531,19 @@ function bindNovelEvents() {
           const si = Number($(this).data('s'));
           if (Number.isInteger(ai) && Number.isInteger(si) && proj.acts[ai]?.sections[si]) {
             collectActsFromDOM(proj);
-            // 重新生成前先重置该节状态，确保覆写
             const secToRegen = proj.acts[ai].sections[si];
             secToRegen.done = false;
             secToRegen.content = '';
+            touchProject(proj);
             const flat = flatSections(proj);
             const f = flat.find((x) => x.actIdx === ai && x.secIdx === si);
+            resetGenerationChannel('novel', { hard: true });
+            await sleep(350);
             await withGenerating(async () => {
-              // skipSummary=true 跳过总结触发，单节重生不影响总结流程
-              await generateSection(proj, ai, si, f ? f.flatIdx : -1, setNovelHint, { skipSummary: true });
+              await generateSection(proj, ai, si, f ? f.flatIdx : -1, setNovelHint, {
+                skipSummary: true,
+                reinforce: true,
+              });
               setNovelHint(`第 ${ai + 1} 章 第 ${si + 1} 节已重新生成。`);
             });
             renderNovelUI();
