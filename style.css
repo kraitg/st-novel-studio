@@ -512,6 +512,16 @@
   margin-top: 6px;
   margin-bottom: 0;
 }
+.ns-char-chains-block .ns-table th:nth-child(3),
+.ns-char-chains-block .ns-table td.ns-char-latest {
+  min-width: 10em;
+  max-width: 22em;
+  vertical-align: top;
+}
+.ns-char-latest {
+  line-height: 1.55;
+  font-size: 0.9em;
+}
 .ns-live-progress__title {
   display: flex;
   align-items: baseline;
@@ -725,6 +735,20 @@
   background: var(--SmartThemeQuoteColor, #6a8dff);
   color: #fff;
 }
+.ns-tag--pending {
+  background: #c47a2c;
+  color: #fff;
+}
+.ns-section--pending-sum {
+  border-color: #c47a2c;
+  box-shadow: 0 0 0 1px rgba(196, 122, 44, 0.35) inset;
+}
+.ns-btn--confirm-sum {
+  background: #c47a2c !important;
+  color: #fff !important;
+  border-color: #a86520 !important;
+  font-weight: 600;
+}
 
 /* 章-节层次 */
 .ns-act {
@@ -864,6 +888,13 @@ body.ns-dragging-active * {
 }
 .ns-chapter__gen {
   margin: 6px 0;
+}
+.ns-gen-status {
+  font-size: 0.82rem;
+  line-height: 1.35;
+  color: var(--SmartThemeQuoteColor, #6a8dff);
+  margin-bottom: 4px;
+  word-break: break-word;
 }
 .ns-gen-meta {
   display: flex;
