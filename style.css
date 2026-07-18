@@ -263,6 +263,13 @@
   border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
   max-width: 220px;
 }
+.ns-input {
+  padding: 4px 8px;
+  border-radius: 6px;
+  color: var(--SmartThemeBodyColor, #e6e6e6);
+  background: var(--black30a, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+}
 
 .ns-btn--sm {
   padding: 3px 10px;
@@ -485,10 +492,21 @@
   font-size: 0.82rem;
   opacity: 0.92;
 }
-.ns-char-chains-block {
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 2px solid var(--SmartThemeBorderColor, rgba(255, 180, 100, 0.35));
+.ns-plot-chains-block {
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255, 176, 96, 0.3);
+}
+.ns-plot-chain {
+  line-height: 1.8;
+  margin: 6px 0 10px;
+  font-size: 0.88rem;
+}
+.ns-plot-chain-step {
+  display: inline;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 176, 96, 0.14);
 }
 .ns-char-chains-block .ns-table {
   margin-top: 6px;
@@ -498,7 +516,8 @@
   display: flex;
   align-items: baseline;
   gap: 8px;
-  margin-bottom: 2px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
 }
 .ns-live-progress .ns-table {
   margin-bottom: 8px;
@@ -846,11 +865,30 @@ body.ns-dragging-active * {
 .ns-chapter__gen {
   margin: 6px 0;
 }
+.ns-gen-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 4px;
+}
 .ns-gen-label {
   display: inline-block;
   font-size: 0.8rem;
-  margin-bottom: 4px;
   color: var(--SmartThemeQuoteColor, #6a8dff);
+}
+.ns-gen-pct {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.ns-gen-elapsed {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+  color: var(--SmartThemeEmColor, rgba(255, 255, 255, 0.65));
+  white-space: nowrap;
+}
+.ns-progress__bar--stream {
+  transition: width 0.25s linear;
 }
 
 .ns-summaries {
